@@ -1,0 +1,20 @@
+# OPT-IN. Copy to a repo as .github/workflows/codeql.yml only when you want
+# CodeQL static analysis. Produces check context: codeql / analyze
+#
+# The permissions block is REQUIRED — CodeQL uploads results (security-events:write).
+# Set `languages` to your CodeQL-supported languages.
+name: CodeQL
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "0 6 * * 1"
+jobs:
+  codeql:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      security-events: write
+    uses: YOUR-ORG/CICD/.github/workflows/codeql.yml@v1
+    with:
+      languages: "javascript-typescript"

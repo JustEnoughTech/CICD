@@ -1,8 +1,10 @@
 # Copy to each repo as .github/workflows/security.yml
-# Produces required checks: security / secrets, security / trivy (+ analyze if CodeQL on)
+# Produces required checks: security / secrets, security / trivy
 #
 # PR-only + weekly schedule. Schedule runs the heavy full-history/full-DB scan
 # off the PR path. Draft PRs skip; schedule always runs.
+# Needs only the default read-only token — no permissions block required.
+# For CodeQL, add caller-codeql.yml (separate, opt-in) — see templates/.
 name: Security
 on:
   pull_request:
@@ -14,5 +16,3 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     uses: YOUR-ORG/CICD/.github/workflows/security.yml@v1
     secrets: inherit
-    # with:
-    #   codeql-languages: "javascript-typescript" # set to enable CodeQL; omit to skip
