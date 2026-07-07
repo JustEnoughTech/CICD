@@ -21,9 +21,10 @@ on:
         type: string
         default: "8.18.4"
 
+# Default = read-only so callers with a restricted token don't hit a startup
+# escalation error. Only the CodeQL job elevates (below).
 permissions:
   contents: read
-  security-events: write
 
 concurrency:
   group: security-${{ github.workflow }}-${{ github.ref }}
@@ -83,6 +84,11 @@ jobs:
     if: inputs.codeql-languages != ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # CodeQL needs to upload results. Caller must grant this when enabling CodeQL:
+    #   jobs.security.permissions: { contents: read, security-events: write }
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v3
