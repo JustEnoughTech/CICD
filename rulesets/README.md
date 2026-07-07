@@ -63,9 +63,11 @@ The ruleset is only the gate. The checks it requires come from reusable workflow
 
 ```
 .github/workflows/ci.yml         reusable: jobs lint, format, test, e2e, build(+smoke)
-.github/workflows/security.yml   reusable: jobs secrets (gitleaks), trivy (make trivy), analyze (CodeQL, opt-in)
+.github/workflows/security.yml   reusable: jobs secrets (gitleaks), trivy (make trivy)  [contents:read only]
+.github/workflows/codeql.yml     reusable: CodeQL analyze — OPT-IN (needs security-events:write)
 templates/caller-ci.yml          copy to each repo -> .github/workflows/ci.yml
 templates/caller-security.yml    copy to each repo -> .github/workflows/security.yml
+templates/caller-codeql.yml      OPT-IN -> .github/workflows/codeql.yml (grants security-events:write)
 templates/Makefile               the language-agnostic contract each repo implements
 templates/CODEOWNERS             copy to each repo -> .github/CODEOWNERS
 templates/lefthook.yml           copy to each repo root -> client-side hooks (make hooks)
@@ -156,5 +158,6 @@ roll out SSH signing to all devs and bots — heavier onboarding.
 - Dependabot alerts + security updates
 - Require 2FA for org members
 - CODEOWNERS per repo (`templates/CODEOWNERS`) — file 01 requires code-owner review
-- CodeQL: enable per repo (default setup), set `codeql-languages` in the security caller,
-  then optionally add a `code_scanning` alert-gate rule to `01`
+- CodeQL: opt in per repo by adding `templates/caller-codeql.yml` (it grants the required
+  `security-events:write`); then optionally add a `code_scanning` alert-gate rule + require the
+  `codeql / analyze` context in `01`
