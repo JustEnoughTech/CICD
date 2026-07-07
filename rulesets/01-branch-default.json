@@ -17,7 +17,7 @@
     },
     "repository_name": {
       "include": ["~ALL"],
-      "exclude": ["archive-*", "sandbox-*"],
+      "exclude": ["archive-*", "sandbox-*", "CICD"],
       "protected": true
     }
   },
