@@ -1,0 +1,14 @@
+# Copy to each repo as .github/CODEOWNERS (or repo root).
+# The branch ruleset's require_code_owner_review means a matching owner must
+# approve before merge. Without this file, no path has an owner and that
+# requirement can't be satisfied.
+#
+# Replace with real teams. Order matters — last match wins.
+
+*                       @YOUR-ORG/engineering
+
+# Lock down CI/CD and security config to a smaller group:
+/.github/                @YOUR-ORG/platform
+/.github/workflows/      @YOUR-ORG/platform
+CODEOWNERS               @YOUR-ORG/platform
+/Makefile                @YOUR-ORG/platform

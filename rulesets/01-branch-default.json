@@ -1,0 +1,58 @@
+{
+  "_comment": "Required-check contexts use the reusable-workflow form '<caller-job> / <job>'. Callers must name jobs 'ci' and 'security' (see templates/). CodeQL alert-gating (code_scanning rule) is intentionally NOT here — it blocks repos without scanning set up; enable per-repo, then add it. Secret gate = gitleaks (security / secrets), works everywhere.",
+  "name": "org-branch-default-protection",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": 1,
+      "actor_type": "OrganizationAdmin",
+      "bypass_mode": "pull_request"
+    }
+  ],
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    },
+    "repository_name": {
+      "include": ["~ALL"],
+      "exclude": ["archive-*", "sandbox-*"],
+      "protected": true
+    }
+  },
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    { "type": "required_linear_history" },
+    { "type": "required_signatures" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": true,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": true,
+        "automatic_copilot_code_review_enabled": false,
+        "allowed_merge_methods": ["squash"]
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          { "context": "ci / lint" },
+          { "context": "ci / format" },
+          { "context": "ci / test" },
+          { "context": "ci / e2e" },
+          { "context": "ci / build" },
+          { "context": "security / secrets" },
+          { "context": "security / trivy" }
+        ]
+      }
+    }
+  ]
+}

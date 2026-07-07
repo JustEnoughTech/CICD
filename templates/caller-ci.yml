@@ -1,0 +1,21 @@
+# Copy to each repo as .github/workflows/ci.yml
+# Produces required checks: ci / lint, ci / format, ci / test, ci / e2e, ci / build
+#
+# PR-only trigger (Lever 2, min CI minutes): no `push` trigger — direct pushes to
+# main are blocked by the ruleset anyway, and per-branch push runs just duplicate
+# the PR run. Checks run once per PR update; concurrency cancels stale runs.
+# NOTE: no `paths-ignore` — with required checks, a skipped run stays "pending"
+# forever and blocks merge. Don't add it.
+name: CI
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+jobs:
+  ci:
+    # skip drafts — they can't merge anyway; runs when marked ready_for_review
+    if: github.event.pull_request.draft == false
+    uses: YOUR-ORG/CICD/.github/workflows/ci.yml@v1
+    secrets: inherit
+    # with:
+    #   runner: ubuntu-latest
+    #   timeout-minutes: 20

@@ -1,0 +1,68 @@
+# Reusable CI. Language-agnostic: every lane shells out to a `make` target the
+# calling repo defines (see templates/Makefile for the contract). Repos that
+# lack a lane define a no-op target — explicit opt-out, never a silent skip.
+# Toolchain/dependency setup belongs in each `make` target (depend on `bootstrap`),
+# NOT in this workflow — keeps it stack-neutral and free of shell-injection surface.
+#
+# Check contexts produced (list these in the org ruleset):
+#   ci / lint   ci / format   ci / test   ci / e2e   ci / build
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        default: ubuntu-latest
+        description: Runner label.
+      timeout-minutes:
+        type: number
+        default: 20
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: make lint
+
+  format:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: format check (prettier/gofmt/black — repo decides)
+        run: make format-check
+
+  test:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: unit + sanity tests
+        run: make test
+
+  e2e:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: make e2e
+
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: build artifact/image
+        run: make build
+      - name: smoke — boot it, hit healthcheck (build-only deploy gate)
+        run: make smoke

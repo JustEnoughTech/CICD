@@ -1,0 +1,60 @@
+{
+  "_comment": "ENTERPRISE CLOUD ONLY. Push rulesets block bad blobs before they enter history. Perf (no giant files bloating clones) + security (no secrets/keys committed). Will 422 on Free/Team — skip it there.",
+  "name": "org-push-hardening",
+  "target": "push",
+  "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": 1,
+      "actor_type": "OrganizationAdmin",
+      "bypass_mode": "always"
+    }
+  ],
+  "conditions": {
+    "repository_name": {
+      "include": ["~ALL"],
+      "exclude": ["archive-*", "sandbox-*"],
+      "protected": true
+    }
+  },
+  "rules": [
+    {
+      "type": "max_file_size",
+      "parameters": {
+        "max_file_size": 100
+      }
+    },
+    {
+      "type": "file_extension_restriction",
+      "parameters": {
+        "restricted_file_extensions": [
+          "pem", "key", "pfx", "p12", "keystore", "jks",
+          "env", "pkl", "so", "dll", "exe", "jar",
+          "zip", "tar", "gz", "7z", "iso", "dmg"
+        ]
+      }
+    },
+    {
+      "type": "file_path_restriction",
+      "parameters": {
+        "restricted_file_paths": [
+          "**/.env",
+          "**/.env.*",
+          "**/id_rsa",
+          "**/id_dsa",
+          "**/*.pem",
+          "**/credentials.json",
+          "**/serviceAccount*.json",
+          "**/.aws/credentials",
+          "**/secrets/**"
+        ]
+      }
+    },
+    {
+      "type": "max_file_path_length",
+      "parameters": {
+        "max_file_path_length": 255
+      }
+    }
+  ]
+}

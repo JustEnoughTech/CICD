@@ -1,0 +1,38 @@
+{
+  "name": "org-tag-release-protection",
+  "target": "tag",
+  "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": 1,
+      "actor_type": "OrganizationAdmin",
+      "bypass_mode": "always"
+    }
+  ],
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/tags/v*", "refs/tags/release-*"],
+      "exclude": []
+    },
+    "repository_name": {
+      "include": ["~ALL"],
+      "exclude": ["archive-*", "sandbox-*"],
+      "protected": true
+    }
+  },
+  "rules": [
+    { "type": "deletion" },
+    { "type": "update" },
+    { "type": "non_fast_forward" },
+    { "type": "required_signatures" },
+    {
+      "type": "tag_name_pattern",
+      "parameters": {
+        "name": "semver-or-release",
+        "operator": "regex",
+        "pattern": "^(v\\d+\\.\\d+\\.\\d+|release-\\d{4}\\.\\d{2}\\.\\d{2})$",
+        "negate": false
+      }
+    }
+  ]
+}

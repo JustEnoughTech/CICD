@@ -1,0 +1,32 @@
+# Copy to repo root as .gitleaks.toml — allowlist for FALSE POSITIVES only.
+# Real secrets must be rotated + removed, never allowlisted.
+#
+# Two suppression mechanisms:
+#   1. This file's [allowlist] — patterns/paths/regexes (broad, rule-level).
+#   2. .gitleaksignore — one finding fingerprint per line (surgical, per-hit).
+#      Get a fingerprint from a failed run's output: "<commit>:<file>:<rule>:<line>".
+#
+# Extend the default ruleset; don't replace it.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "repo-wide false-positive allowlist"
+
+# Paths that are test fixtures / examples / docs — never real secrets.
+paths = [
+  '''(^|/)(test|tests|__tests__|fixtures|examples|testdata)(/|$)''',
+  '''(^|/)vendor/''',
+  '''\.lock$''',
+  '''(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|go\.sum)$''',
+]
+
+# Known-safe placeholder/dummy values that trip detectors.
+regexes = [
+  '''EXAMPLE[_-]?KEY''',
+  '''(?i)dummy|placeholder|changeme|your[_-]?token[_-]?here''',
+  '''AKIAIOSFODNN7EXAMPLE''',
+]
+
+# Specific commit shas to skip entirely (use sparingly).
+# commits = ["<sha>"]

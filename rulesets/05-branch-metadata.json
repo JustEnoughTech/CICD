@@ -1,0 +1,44 @@
+{
+  "_comment": "Optional. Enforces commit hygiene org-wide: authored by a corp-domain email, sane commit subject. Tune the email pattern to your domain before enabling. Metadata rules require Enterprise for org-level scope.",
+  "name": "org-commit-metadata",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": 1,
+      "actor_type": "OrganizationAdmin",
+      "bypass_mode": "always"
+    }
+  ],
+  "conditions": {
+    "ref_name": {
+      "include": ["~ALL"],
+      "exclude": []
+    },
+    "repository_name": {
+      "include": ["~ALL"],
+      "exclude": ["archive-*", "sandbox-*"],
+      "protected": true
+    }
+  },
+  "rules": [
+    {
+      "type": "commit_author_email_pattern",
+      "parameters": {
+        "name": "corp-domain-email",
+        "operator": "ends_with",
+        "pattern": "@YOURDOMAIN.com",
+        "negate": false
+      }
+    },
+    {
+      "type": "commit_message_pattern",
+      "parameters": {
+        "name": "conventional-commit",
+        "operator": "regex",
+        "pattern": "^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\\(.+\\))?!?: .{1,}",
+        "negate": false
+      }
+    }
+  ]
+}

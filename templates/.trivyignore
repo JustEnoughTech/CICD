@@ -1,0 +1,9 @@
+# Copy to repo root as .trivyignore — suppress ACCEPTED trivy findings by ID.
+# One ID per line. Prefer fixing/upgrading over ignoring. Add a comment + review
+# date so ignores don't rot.
+#
+# Vulnerability IDs (CVE / GHSA):
+# CVE-2023-12345   # transitive dep, no fix upstream yet — revisit 2026-Q3
+#
+# Misconfig IDs (only relevant if you opt misconfig back in):
+# AVD-DS-0002      # running as root — base image constraint, accepted

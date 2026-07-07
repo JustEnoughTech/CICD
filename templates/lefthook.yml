@@ -1,0 +1,26 @@
+# Client-side git hooks (Lever 1). Install once per clone: `make hooks`.
+# Runs the SAME make targets CI runs, so failures surface at commit/push time
+# instead of after burning Actions minutes. Fast lanes at commit, slow at push.
+#
+# Advisory, not enforcement: bypass with `git commit --no-verify` / `git push --no-verify`.
+# The server-side ruleset + CI is the real gate; this just shifts feedback left.
+
+pre-commit:
+  parallel: true
+  commands:
+    format:
+      run: make format-check
+    lint:
+      run: make lint
+    # scans STAGED changes only — stops a secret before it enters a commit
+    secrets:
+      run: make secrets
+
+pre-push:
+  parallel: true
+  commands:
+    test:
+      run: make test
+    # heavier — vuln scan before it hits CI. Drop this block if too slow locally.
+    trivy:
+      run: make trivy

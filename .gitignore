@@ -1,0 +1,4 @@
+# local tool caches / editor state — not part of the deliverable
+.tokensave/
+.claude/
+.DS_Store

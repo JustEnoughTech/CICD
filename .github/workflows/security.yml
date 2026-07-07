@@ -1,0 +1,93 @@
+# Reusable security scan. Two lanes:
+#   secrets  — gitleaks, language-agnostic, ALWAYS runs. Mandatory gate.
+#   analyze  — CodeQL, opt-in. Runs only when `codeql-languages` is set.
+#
+# Check contexts produced:
+#   security / secrets   (require this in the ruleset)
+#   security / trivy     (require this in the ruleset)
+#   security / analyze   (only appears when CodeQL enabled; keep opt-in)
+name: Security
+
+on:
+  workflow_call:
+    inputs:
+      codeql-languages:
+        type: string
+        default: ""
+        description: >-
+          Comma list, e.g. "javascript-typescript,python". Empty = skip CodeQL and
+          rely on gitleaks + GitHub secret scanning (org setting).
+      gitleaks-version:
+        type: string
+        default: "8.18.4"
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        # PR: scan only the PR's new commits (base..head) so legacy history in an
+        # existing repo can't block merges. Schedule/other: full-history scan (alert).
+        # SHAs via env = injection-safe. .gitleaks.toml / .gitleaksignore in repo tune it.
+        env:
+          GL_VERSION: ${{ inputs.gitleaks-version }}
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}"
+          tar="gitleaks_${GL_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "$base/$tar" -o "$tar"
+          curl -sSfL "$base/gitleaks_${GL_VERSION}_checksums.txt" -o gl_sums.txt
+          grep " $tar$" gl_sums.txt | sha256sum -c -
+          tar -xzf "$tar" gitleaks
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "scanning PR range ${BASE_SHA}..${HEAD_SHA}"
+            ./gitleaks detect --redact --no-banner --exit-code 1 \
+              --log-opts="--no-merges ${BASE_SHA}..${HEAD_SHA}"
+          else
+            echo "scanning full history"
+            ./gitleaks detect --source . --redact --no-banner --exit-code 1
+          fi
+
+  trivy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - id: dbkey
+        run: echo "week=$(date +%Y-%U)" >> "$GITHUB_OUTPUT"
+      - name: cache trivy vuln DB (weekly key — the slow part)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ steps.dbkey.outputs.week }}
+          restore-keys: trivy-db-
+      - name: trivy scan (adapter — repo's `make trivy` owns fs-vs-image, severity)
+        run: make trivy
+
+  analyze:
+    if: inputs.codeql-languages != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ inputs.codeql-languages }}
+          queries: security-extended
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
