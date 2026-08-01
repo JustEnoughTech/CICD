@@ -51,6 +51,23 @@ than silent: re-verify against the recorded SHA before pulling anything new. Thi
 bookkeeping — a confident, precise, wrong licence claim is what put this lane on hold in the
 first place.
 
+## What was stripped at vendor time
+
+**Only `*.yaml`/`*.yml` rule files, each source's `LICENSE`, and this README are kept.**
+161 non-rule files were removed — the deliberately-vulnerable example/test fixtures upstream
+ships beside each rule (49 `.c`, 17 `.py`, 12 `.java`, 11 `.js`, …) for `semgrep test`.
+
+They are removed for two reasons, and both are load-bearing:
+
+1. **They are real vulnerable code.** Vendoring them puts working command-injection and
+   double-free samples into a **public** repo, where they trip our own scanners and anyone
+   else's.
+2. **They made the lane always-red.** opengrep scans the workspace, so those fixtures produced
+   guaranteed `ERROR` findings unrelated to the repo's own code. An always-red gate is exactly
+   as useless as an always-green one, and harder to argue with.
+
+Rule count is unchanged by the strip: **245 before, 245 after.**
+
 ## Curation decisions
 
 - **elttam: `rules/` only, not `rules-audit/`.** Upstream's own README splits them — `rules/` are
