@@ -356,9 +356,19 @@ bandit: bootstrap
 # duplicate the repo's own `make lint` eslint config — this lane reports security
 # rules and nothing else.
 #
+# The config and its node_modules live together in a temp dir, and the REPO is
+# passed as the lint target. ESLint resolves plugin imports relative to the
+# config file, so a config in a temp dir with the packages installed elsewhere
+# (e.g. via `npx -p`) fails with ERR_MODULE_NOT_FOUND. Keep them co-located.
+#
+# ⚠️ The plugin ships all 14 rules at severity "warn". A config that just spreads
+# `recommended` therefore CANNOT FAIL — verified: an eval() + child_process
+# fixture returned "0 errors, 2 warnings" and exit 0. The generated config below
+# promotes every rule to "error" for that reason.
+#
 # Known noise: `detect-object-injection` fires on virtually any `obj[key]` and is
-# the reason this plugin has a bad reputation. It is set to "warn" below and so
-# does not gate; everything else errors. Re-enable it deliberately if you want it.
+# why this plugin has a bad reputation. It alone stays at "warn", so it reports
+# without gating. Promote it deliberately if you want it.
 ESLINT_VERSION ?= 10.8.0
 ESLINT_PLUGIN_SECURITY_VERSION ?= 4.0.1
 eslint-security: bootstrap
@@ -366,15 +376,28 @@ eslint-security: bootstrap
 	if [ ! -f package.json ]; then \
 	  echo "SKIP(eslint-security): no package.json — not a Node repo."; exit 0; \
 	fi; \
-	cfg="$$(mktemp -d)/eslint.security.mjs"; \
+	target="$$PWD"; \
+	d="$$(mktemp -d)"; \
+	trap 'rm -rf "$$d"' EXIT; \
+	: > "$$d/package.json"; printf '{"name":"sec","private":true,"type":"module"}' > "$$d/package.json"; \
+	( cd "$$d" && npm install --silent --no-audit --no-fund \
+	    "eslint@$(ESLINT_VERSION)" "eslint-plugin-security@$(ESLINT_PLUGIN_SECURITY_VERSION)" ); \
 	printf '%s\n' \
 	  "import security from 'eslint-plugin-security';" \
+	  "const rec = security.configs.recommended;" \
+	  "// The plugin ships EVERY rule at 'warn'. Left alone, and with warnings" \
+	  "// not failing, this lane could never go red — decoration, not a gate." \
+	  "// Promote all to 'error', then demote only the known-noisy one." \
+	  "const promoted = Object.fromEntries(" \
+	  "  Object.keys(rec.rules).map((r) => [r, 'error'])" \
+	  ");" \
 	  "export default [" \
-	  "  security.configs.recommended," \
-	  "  { rules: { 'security/detect-object-injection': 'warn' } }," \
-	  "];" > "$$cfg"; \
-	npx --yes -p eslint@$(ESLINT_VERSION) -p eslint-plugin-security@$(ESLINT_PLUGIN_SECURITY_VERSION) \
-	  eslint --no-config-lookup -c "$$cfg" --max-warnings=-1 . ; \
+	  "  rec," \
+	  "  { plugins: { security }, rules: { ...promoted," \
+	  "      'security/detect-object-injection': 'warn' } }," \
+	  "];" > "$$d/eslint.security.mjs"; \
+	"$$d/node_modules/.bin/eslint" --no-config-lookup -c "$$d/eslint.security.mjs" \
+	  --max-warnings=-1 "$$target"; \
 	echo "OK(eslint-security): no eslint-plugin-security errors"
 
 # ---------------------------------------------------------------------------
