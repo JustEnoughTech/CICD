@@ -6,6 +6,7 @@
 #
 # Check contexts produced (list these in the org ruleset):
 #   ci / lint   ci / format   ci / test   ci / e2e   ci / build
+#   ci / dast   (NOT yet in rulesets/ — see README "Adding these to the ruleset")
 name: CI
 
 on:
@@ -18,6 +19,19 @@ on:
       timeout-minutes:
         type: number
         default: 20
+      # --- DAST -------------------------------------------------------------
+      zap-image:
+        type: string
+        default: "ghcr.io/zaproxy/zaproxy:2.17.0"
+        description: >-
+          Pinned ZAP image. Do NOT use :stable — it is a mutable tag, and a
+          scanner that changes under you is not a reproducible gate.
+      zap-fail-on:
+        type: string
+        default: "FAIL"
+        description: >-
+          FAIL = fail only on ZAP FAIL-level alerts (passes -I).
+          WARN = also fail on WARN-level alerts. Noisy on first contact.
 
 permissions:
   contents: read
@@ -31,14 +45,14 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - run: make lint
 
   format:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: format check (prettier/gofmt/black — repo decides)
         run: make format-check
 
@@ -46,7 +60,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: unit + sanity tests
         run: make test
 
@@ -54,15 +68,80 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - run: make e2e
 
   build:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: build artifact/image
         run: make build
       - name: smoke — boot it, hit healthcheck (build-only deploy gate)
         run: make smoke
+
+  # DAST — OWASP ZAP baseline (PASSIVE). Active scanning is too slow and too
+  # destructive for a PR gate; run it on a schedule instead (not wired here).
+  #
+  # Boots via `make dast-up`, which REUSES the repo's existing `smoke` boot
+  # commands — one boot mechanism, not a second parallel path.
+  #
+  # Pure-docker ZAP on purpose: zaproxy/action-baseline defaults to
+  # allow_issue_writing:true and would need `issues: write`, breaking the
+  # contents-read-only contract. It also defaults to fail_action:false — i.e.
+  # green on alerts. Neither is acceptable in a gate.
+  dast:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - id: target
+        name: resolve DAST target (empty = repo opted out)
+        run: printf 'url=%s\n' "$(make dast-target)" >> "$GITHUB_OUTPUT"
+      - name: boot service (reuses the smoke boot recipe)
+        # Hard-fails unless the repo set DAST_OPT_OUT=true with a reason, so a
+        # missing DAST config can never read as a silent pass.
+        run: make dast-up
+      - name: ZAP baseline
+        env:
+          TARGET: ${{ steps.target.outputs.url }}
+          ZAP_IMAGE: ${{ inputs.zap-image }}
+          ZAP_FAIL_ON: ${{ inputs.zap-fail-on }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TARGET" ]; then
+            echo "SKIP(dast): this repo declares no DAST target — DAST_OPT_OUT=true in its Makefile."
+            echo "  Passing explicitly with a stated reason, NOT because the scan found nothing."
+            exit 0
+          fi
+          mkdir -p zap-out && chmod 777 zap-out   # ZAP runs as uid 1000 inside
+          flags="-I"   # -I = tolerate WARN-level alerts (suppresses exit 2)
+          if [ "$ZAP_FAIL_ON" = "WARN" ]; then flags=""; fi
+          rc=0   # capture rc BEFORE any pipe — a pipeline would mask it
+          docker run --rm --network host -v "$PWD/zap-out:/zap/wrk:rw" -t \
+            "$ZAP_IMAGE" zap-baseline.py -t "$TARGET" \
+            -J report.json -r report.html $flags || rc=$?
+          # ZAP exit codes: 0 pass · 1 FAIL alerts · 2 WARN alerts (only without -I)
+          #                 3 exception OR target unreachable / no rules ran
+          case "$rc" in
+            0) echo "OK(dast): ZAP baseline clean at threshold $ZAP_FAIL_ON" ;;
+            1) echo "FAIL(dast): ZAP reported FAIL-level alerts — see the zap-report artifact"; exit 1 ;;
+            2) echo "FAIL(dast): ZAP reported WARN-level alerts (zap-fail-on=WARN)"; exit 1 ;;
+            3) echo "FAIL(dast): ZAP exited 3 — target unreachable or no rules ran."
+               echo "  This is an INFRASTRUCTURE failure, not a clean scan. The service at"
+               echo "  $TARGET never came up, so nothing was actually scanned. Never pass this."
+               exit 1 ;;
+            *) echo "FAIL(dast): ZAP exited $rc — unexpected; treating as failure"; exit 1 ;;
+          esac
+      - name: teardown
+        if: always()
+        run: make dast-down
+      - name: upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: zap-report
+          path: zap-out/
+          if-no-files-found: ignore
+          retention-days: 14

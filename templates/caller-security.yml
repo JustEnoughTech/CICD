@@ -1,5 +1,8 @@
 # Copy to each repo as .github/workflows/security.yml
-# Produces required checks: security / secrets, security / trivy
+# Produces checks: security / secrets, security / trivy, security / sast,
+#                  security / sca, security / sbom
+# Only secrets + trivy are required by the ruleset today — see the CICD README
+# section "Adding these to the ruleset" before requiring the other three.
 #
 # PR-only + weekly schedule. Schedule runs the heavy full-history/full-DB scan
 # off the PR path. Draft PRs skip; schedule always runs.
@@ -16,3 +19,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     uses: YOUR-ORG/CICD/.github/workflows/security.yml@v1
     secrets: inherit
+    # with:
+    #   runner: ubuntu-latest    # set to your self-hosted runner label
+    #   sca-severity: CRITICAL   # ratchet to HIGH once the repo is clean
+    #   sast-severity: ERROR

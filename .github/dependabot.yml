@@ -1,0 +1,27 @@
+# Dependabot for THIS repo. The only dependencies here are the GitHub Actions
+# pinned in .github/workflows/ — there is no application code.
+#
+# Runs GitHub-side: no runner, no Actions minutes, unaffected by the org's $0
+# spending limit. That is precisely why it matters here — it is the one control
+# that keeps working while CI is unfundable.
+#
+# It exists because every pin that predated the shift-left work was up to three
+# majors behind (checkout v4, upload-artifact v4, cache v4) and trivy was pinned
+# to a release that had been DELETED upstream. Nobody noticed, because nothing ran.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(actions)"
+    labels: ["dependencies", "github-actions"]
+    groups:
+      # One PR for all routine action bumps; majors stay separate because they
+      # carry breaking changes and need their release notes read individually.
+      actions-minor-patch:
+        update-types: ["minor", "patch"]

@@ -1,22 +1,94 @@
 # Reusable security scan — lanes that need only `contents: read`, so any caller
 # (default read-only token) can call it with no permission grant.
-#   secrets — gitleaks, language-agnostic, ALWAYS runs. Mandatory gate.
-#   trivy   — vuln scan via `make trivy` (adapter). Mandatory gate.
+#   secrets — gitleaks, language-agnostic, ALWAYS runs. Gates.
+#   trivy   — OS-package + lockfile vuln scan via `make trivy`. Gates.
+#   trivy-image — scans the BUILT IMAGE via `make trivy-image`. Gates.
+#   versions— every pinned tool version still downloadable. Gates.
+#   sast    — opengrep (vendored rules) + njsscan/bandit. Gates at SAST_SEVERITY.
+#   sca     — osv-scanner lockfile vulns via `make sca`. Gates at sca-severity.
+#   sbom    — syft CycloneDX + SPDX via `make sbom`. ARTIFACT-ONLY, NON-GATING.
+#
+# Every lane either gates on a stated threshold or is documented artifact-only.
+# There is no third category. `sbom` is the only artifact-only lane here: syft
+# is a generator with no findings and no severity concept, so a threshold on it
+# would be decoration. It fails only if generation itself fails.
+#
 # CodeQL lives in a SEPARATE opt-in workflow (codeql.yml) because it needs
 # security-events:write — bundling it here made every caller hit a startup
-# escalation error.
+# escalation error. For the same reason there is NO SARIF upload anywhere here:
+# github/codeql-action/upload-sarif needs GHAS on private repos and would 403.
+# Findings travel as workflow artifacts; the gate is the exit code.
 #
 # Check contexts produced:
-#   security / secrets   (require this in the ruleset)
-#   security / trivy     (require this in the ruleset)
+#   security / secrets   (already required in the ruleset)
+#   security / trivy     (already required in the ruleset)
+#   security / sast      (NOT yet in rulesets/ — see README "Adding these to the ruleset")
+#   security / sca       (NOT yet in rulesets/ — see README)
+#   security / sbom      (NOT yet in rulesets/ — see README)
 name: Security
 
 on:
   workflow_call:
     inputs:
+      runner:
+        type: string
+        default: ubuntu-latest
+        description: Runner label.
       gitleaks-version:
         type: string
-        default: "8.18.4"
+        default: "8.30.1"
+      trivy-image-severity:
+        type: string
+        default: "CRITICAL"
+        description: 'Container-image gate. CRITICAL | HIGH | MEDIUM | LOW.'
+      trivy-version:
+        type: string
+        default: "0.72.0"
+        description: >-
+          aquasecurity prunes old releases; a deleted tag 404s and takes this
+          mandatory gate down everywhere. Repin here, not in the repo Makefile.
+      # --- SAST -------------------------------------------------------------
+      sast-severity:
+        type: string
+        default: "ERROR"
+        description: 'Fail at/above this level. ERROR | WARNING.'
+      njsscan-version:
+        type: string
+        default: "0.4.3"
+      bandit-version:
+        type: string
+        default: "1.9.4"
+      opengrep-version:
+        type: string
+        default: "1.26.0"
+      rules-repo:
+        type: string
+        default: "JustEnoughTech/CICD"
+        description: Repo holding the vendored SAST rules (this one).
+      rules-ref:
+        type: string
+        default: "v1"
+        description: >-
+          Tag/SHA of rules-repo to pull rules from. Keep this equal to the @vX
+          the caller pins the workflow itself to, so rules and workflow move together.
+      # --- SCA --------------------------------------------------------------
+      sca-severity:
+        type: string
+        default: "CRITICAL"
+        description: 'Fail at/above this severity. CRITICAL | HIGH | MEDIUM | LOW.'
+      sca-fixable-only:
+        type: boolean
+        default: true
+        description: >-
+          Only fail on vulns that HAVE a fix. An unfixable upstream CVE would
+          otherwise block every merge with no available remediation.
+      osv-scanner-version:
+        type: string
+        default: "2.4.0"
+      # --- SBOM -------------------------------------------------------------
+      syft-version:
+        type: string
+        default: "1.50.0"
 
 permissions:
   contents: read
@@ -27,10 +99,10 @@ concurrency:
 
 jobs:
   secrets:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
       - name: gitleaks
@@ -50,27 +122,158 @@ jobs:
           curl -sSfL "$base/gitleaks_${GL_VERSION}_checksums.txt" -o gl_sums.txt
           grep " $tar$" gl_sums.txt | sha256sum -c -
           tar -xzf "$tar" gitleaks
+          # `detect`/`protect` were replaced by `git`/`dir` in gitleaks v8.19+.
+          # `detect` still works as a HIDDEN alias (absent from --help), so a blind
+          # version bump would not have broken loudly — it would have kept working
+          # until it silently didn't. Use the supported surface instead.
           if [ "$EVENT" = "pull_request" ]; then
             echo "scanning PR range ${BASE_SHA}..${HEAD_SHA}"
-            ./gitleaks detect --redact --no-banner --exit-code 1 \
+            ./gitleaks git . --redact --no-banner --exit-code 1 \
               --log-opts="--no-merges ${BASE_SHA}..${HEAD_SHA}"
           else
             echo "scanning full history"
-            ./gitleaks detect --source . --redact --no-banner --exit-code 1
+            ./gitleaks git . --redact --no-banner --exit-code 1
           fi
 
   trivy:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - id: dbkey
         run: echo "week=$(date +%Y-%U)" >> "$GITHUB_OUTPUT"
       - name: cache trivy vuln DB (weekly key — the slow part)
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: ~/.cache/trivy
           key: trivy-db-${{ steps.dbkey.outputs.week }}
           restore-keys: trivy-db-
       - name: trivy scan (adapter — repo's `make trivy` owns fs-vs-image, severity)
+        env:
+          TRIVY_VERSION: ${{ inputs.trivy-version }}
         run: make trivy
+
+  sast:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      # Rules are VENDORED in this repo and pulled in here, never fetched from a
+      # rule registry at scan time: the semgrep.dev registry is under a proprietary
+      # licence forbidding redistribution, and a network fetch cannot work air-gapped.
+      # Provenance, licence and commit SHA per source: rules/README.md.
+      - name: fetch vendored SAST rules (pinned)
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ inputs.rules-repo }}
+          ref: ${{ inputs.rules-ref }}
+          path: .cicd-rules
+          sparse-checkout: rules
+      # Move the rules OUT of the workspace before scanning. checkout can only
+      # write inside $GITHUB_WORKSPACE, but opengrep scans the workspace — so
+      # left in place it would scan its own ruleset, and several sources ship
+      # deliberately-vulnerable example files next to each rule (0xdea .c,
+      # elttam .html). Those produce guaranteed findings in every repo.
+      # Relying on --exclude for this does NOT work: the pattern semantics are
+      # subtle and `--exclude rules` was verified NOT to exclude rules/**.
+      # Physically relocating the tree removes the failure mode entirely.
+      - name: stage rules outside the scan target
+        run: mv .cicd-rules "$RUNNER_TEMP/cicd-rules"
+      - name: sast (adapter — repo's `make sast` composes opengrep/njsscan/bandit)
+        env:
+          SAST_SEVERITY: ${{ inputs.sast-severity }}
+          NJSSCAN_VERSION: ${{ inputs.njsscan-version }}
+          BANDIT_VERSION: ${{ inputs.bandit-version }}
+          OPENGREP_VERSION: ${{ inputs.opengrep-version }}
+          OPENGREP_RULES: ${{ runner.temp }}/cicd-rules/rules
+        run: make sast
+      - name: upload sast reports
+        if: always() # findings are the reason the job failed — always publish them
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sast-reports
+          path: |
+            opengrep.json
+            njsscan.json
+            bandit.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  sca:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: sca (adapter — osv-scanner + our severity/fixable filter)
+        env:
+          SCA_SEVERITY: ${{ inputs.sca-severity }}
+          SCA_FIXABLE_ONLY: ${{ inputs.sca-fixable-only }}
+          OSV_VERSION: ${{ inputs.osv-scanner-version }}
+        run: make sca
+      - name: upload sca report
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sca-report
+          path: osv.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ARTIFACT-ONLY, NON-GATING. syft has no findings and no severity concept.
+  # This lane fails only if SBOM generation itself fails. Do not add a threshold.
+  sbom:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: sbom (syft — CycloneDX + SPDX)
+        env:
+          SYFT_VERSION: ${{ inputs.syft-version }}
+        run: make sbom
+      - name: upload sbom
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sbom
+          path: |
+            sbom.cdx.json
+            sbom.spdx.json
+          if-no-files-found: error # an empty SBOM lane would be pure decoration
+          retention-days: 90
+
+  # Scans the BUILT IMAGE — base-image OS packages and anything installed during
+  # the build, none of which `trivy fs` can see. A repo that builds no image must
+  # opt out explicitly in its Makefile (TRIVY_IMAGE_OPT_OUT=true) with a reason;
+  # an unset IMAGE hard-fails rather than passing on an empty scan.
+  trivy-image:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: build the image the scan will target
+        run: make build
+      - name: trivy image scan (adapter)
+        env:
+          TRIVY_VERSION: ${{ inputs.trivy-version }}
+          TRIVY_IMAGE_SEVERITY: ${{ inputs.trivy-image-severity }}
+        run: make trivy-image
+
+  # Asserts every pinned tool version is still DOWNLOADABLE upstream.
+  # This is the control that would have caught trivy 0.55.0 — a release deleted
+  # by aquasecurity while it was pinned here, which 404'd the already-required
+  # `security / trivy` check. Resolution only; Dependabot covers staleness.
+  versions:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: every pinned version still resolves
+        env:
+          TRIVY_VERSION: ${{ inputs.trivy-version }}
+          GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+          OSV_VERSION: ${{ inputs.osv-scanner-version }}
+          SYFT_VERSION: ${{ inputs.syft-version }}
+          OPENGREP_VERSION: ${{ inputs.opengrep-version }}
+          BANDIT_VERSION: ${{ inputs.bandit-version }}
+          NJSSCAN_VERSION: ${{ inputs.njsscan-version }}
+        run: make versions-check

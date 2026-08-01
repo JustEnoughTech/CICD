@@ -5,7 +5,9 @@
 # Put toolchain/dependency install in `bootstrap`; lanes depend on it, so CI
 # never needs stack-specific setup steps.
 .PHONY: bootstrap lint format-check format test e2e build smoke trivy secrets hooks \
-        _ensure-trivy _ensure-gitleaks
+        sast opengrep njsscan bandit sca sbom dast dast-target dast-up dast-down \
+        versions-check trivy-image eslint-security \
+        _ensure-trivy _ensure-gitleaks _ensure-osv _ensure-syft _ensure-opengrep
 
 # Install deps / toolchain. Examples:
 #   npm ci   |   pnpm i --frozen-lockfile   |   go mod download   |   pip install -r requirements.txt
@@ -57,7 +59,7 @@ smoke: build
 # `fs` scan for an image scan (`trivy image $(IMAGE)`) if you build one in `build`.
 # `.trivyignore` in repo root suppresses accepted findings. Install = pinned
 # release tarball + sha256 verify (no curl|sh from an unpinned branch).
-TRIVY_VERSION ?= 0.55.0
+TRIVY_VERSION ?= 0.72.0
 trivy: bootstrap _ensure-trivy
 	trivy fs --scanners vuln \
 	  --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress .
@@ -67,8 +69,45 @@ trivy: bootstrap _ensure-trivy
 #	trivy fs --scanners vuln,misconfig,secret \
 #	  --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress .
 
+# Container SCA — scans the BUILT IMAGE, which `trivy fs` cannot see: base-image
+# OS packages, and anything installed during the build rather than declared in a
+# lockfile. For most services this is the larger attack surface of the two.
+#
+# Set IMAGE to what `make build` produces. A repo that builds no image must set
+# TRIVY_IMAGE_OPT_OUT=true WITH a reason — an unset IMAGE hard-fails, so "we
+# never wired this up" can never read as a pass. Same contract as DAST.
+IMAGE ?=
+TRIVY_IMAGE_OPT_OUT ?= false
+# No _ensure-trivy prerequisite on purpose: the opt-out path must not install a
+# tool it will never run. The install happens below, only when we actually scan.
+trivy-image:
+	@set -eu; \
+	if [ -z "$(IMAGE)" ]; then \
+	  if [ "$(TRIVY_IMAGE_OPT_OUT)" = "true" ]; then \
+	    echo "SKIP(trivy-image): repo builds no container image (TRIVY_IMAGE_OPT_OUT=true)."; \
+	    echo "  Explicit opt-out with a stated reason, NOT a clean scan result."; \
+	    exit 0; \
+	  fi; \
+	  echo "FAIL(trivy-image): IMAGE is not set and TRIVY_IMAGE_OPT_OUT is not true."; \
+	  echo "  Set IMAGE to the tag \`make build\` produces, or opt out explicitly."; \
+	  echo "  Refusing to pass silently: a container lane that scans nothing looks"; \
+	  echo "  identical to a container with no vulnerabilities."; \
+	  exit 1; \
+	fi; \
+	$(MAKE) -s -f $(firstword $(MAKEFILE_LIST)) _ensure-trivy; \
+	echo "trivy-image: scanning $(IMAGE) at $(TRIVY_IMAGE_SEVERITY), fixable only"; \
+	trivy image --scanners vuln --severity $(TRIVY_IMAGE_SEVERITY) \
+	  --ignore-unfixed --exit-code 1 --no-progress "$(IMAGE)"; \
+	echo "OK(trivy-image): no fixable vulnerabilities at/above $(TRIVY_IMAGE_SEVERITY) in $(IMAGE)"
+TRIVY_IMAGE_SEVERITY ?= CRITICAL
+
 # Pinned, checksum-verified trivy install. Self-guards: no-op when trivy is
 # present (devs with `brew install trivy`), installs only in CI.
+#
+# NOTE: aquasecurity prunes old releases. A TRIVY_VERSION whose release has been
+# deleted upstream 404s here and takes the mandatory `security / trivy` gate down
+# in every repo at once. It fails LOUD (curl -f -> non-zero), not silently, but
+# when bumping check the tag still exists rather than assuming it is permanent.
 _ensure-trivy:
 	@command -v trivy >/dev/null 2>&1 && exit 0; \
 	  set -eu; ver="$(TRIVY_VERSION)"; \
@@ -88,9 +127,11 @@ _ensure-trivy:
 
 # Local secret scan for the pre-commit hook: scans STAGED changes only (fast).
 # CI scans history/PR-range separately (see security.yml). Same tool, different mode.
-GITLEAKS_VERSION ?= 8.18.4
+GITLEAKS_VERSION ?= 8.30.1
+# `protect --staged` became `git --staged` in gitleaks v8.19+. The old spelling
+# still resolves as a hidden alias, so this change is about not depending on one.
 secrets: _ensure-gitleaks
-	gitleaks protect --staged --redact --no-banner --exit-code 1
+	gitleaks git --staged . --redact --no-banner --exit-code 1
 
 _ensure-gitleaks:
 	@command -v gitleaks >/dev/null 2>&1 && exit 0; \
@@ -107,3 +148,332 @@ _ensure-gitleaks:
 	  tar -xzf "$$tmp/$$tar" -C "$$tmp" gitleaks; \
 	  install -m0755 "$$tmp/gitleaks" /usr/local/bin/gitleaks; \
 	  rm -rf "$$tmp"
+
+# ---------------------------------------------------------------------------
+# SCA — osv-scanner (lockfile vulnerabilities). Complements `trivy` (OS pkgs).
+#
+# THRESHOLD: fails on vulnerabilities at/above SCA_SEVERITY that HAVE A FIX.
+# Fixable-only is deliberate: an unfixable upstream CVE would otherwise block
+# every merge in the repo with no action available to unblock it. Ratchet plan
+# is CRITICAL now -> HIGH once the repos are clean (see CICD README).
+#
+# osv-scanner has NO native severity threshold and NO --severity flag of any
+# kind; the filtering below is ours, applied to its JSON. Do not "simplify" it
+# into a bare `osv-scanner ...` call — you would lose the threshold entirely.
+#
+# !! EXIT CODES ARE LOAD-BEARING. Read before touching:
+#      0   scanned, no vulns
+#      1   vulns found            -> filter by threshold, may still pass
+#    128   NO PACKAGES FOUND      -> no lockfile in repo; explicit pass + reason
+#    else  infrastructure failure -> RED, never a pass
+#    Wrapping this in `|| true` turns every real finding green. That exact
+#    pattern is the defining defect class this pipeline exists to prevent.
+OSV_VERSION ?= 2.4.0
+SCA_SEVERITY ?= CRITICAL
+SCA_FIXABLE_ONLY ?= true
+sca: bootstrap _ensure-osv
+	@set -eu; \
+	case "$(SCA_SEVERITY)" in \
+	  CRITICAL) min=9.0;; HIGH) min=7.0;; MEDIUM) min=4.0;; LOW) min=0.1;; \
+	  *) echo "FAIL(sca): SCA_SEVERITY must be CRITICAL|HIGH|MEDIUM|LOW, got '$(SCA_SEVERITY)'"; exit 1;; \
+	esac; \
+	rc=0; osv-scanner scan source -r . --format json --output-file osv.json || rc=$$?; \
+	if [ "$$rc" -eq 128 ]; then \
+	  echo "SKIP(sca): osv-scanner found no supported lockfile here — nothing to scan."; \
+	  echo "  Explicit pass. If this repo DOES have a lockfile, osv-scanner did not"; \
+	  echo "  recognise it: fix that rather than accepting this message."; \
+	  exit 0; \
+	fi; \
+	if [ "$$rc" -ne 0 ] && [ "$$rc" -ne 1 ]; then \
+	  echo "FAIL(sca): osv-scanner exited $$rc — infrastructure failure, not a clean scan."; \
+	  exit 1; \
+	fi; \
+	test -s osv.json || { echo "FAIL(sca): osv-scanner produced no report (exit $$rc)"; exit 1; }; \
+	fixable='true'; [ "$(SCA_FIXABLE_ONLY)" = "true" ] || fixable='false'; \
+	hits=$$(jq --argjson min "$$min" --argjson fixonly "$$fixable" -r ' \
+	  [ .results[]?.packages[]? \
+	    | . as $$p \
+	    | $$p.groups[]? \
+	    | select((((.max_severity // "") | if . == "" then "0" else . end) | tonumber) >= $$min) \
+	    | . as $$g \
+	    | $$p.vulnerabilities[]? \
+	    | select(.id as $$i | $$g.ids | index($$i)) \
+	    | select(($$fixonly | not) or ([.affected[]?.ranges[]?.events[]? | select(has("fixed"))] | length > 0)) \
+	    | "\($$p.package.ecosystem)/\($$p.package.name)@\($$p.package.version) \(.id) sev=\($$g.max_severity)" \
+	  ] | unique | .[]' osv.json); \
+	if [ -n "$$hits" ]; then \
+	  echo "FAIL(sca): fixable vulnerabilities at/above $(SCA_SEVERITY) (CVSS >= $$min):"; \
+	  echo "$$hits" | sed 's/^/  /'; \
+	  echo "Full report: osv.json (uploaded as a workflow artifact)."; \
+	  exit 1; \
+	fi; \
+	echo "OK(sca): no fixable vulnerabilities at/above $(SCA_SEVERITY) (osv-scanner exit $$rc)"
+
+_ensure-osv:
+	@command -v osv-scanner >/dev/null 2>&1 && exit 0; \
+	  set -eu; ver="$(OSV_VERSION)"; \
+	  os="$$(uname -s | tr '[:upper:]' '[:lower:]')"; arch="$$(uname -m)"; \
+	  case "$$arch" in x86_64) arch=amd64;; aarch64) arch=arm64;; esac; \
+	  bin="osv-scanner_$${os}_$${arch}"; \
+	  base="https://github.com/google/osv-scanner/releases/download/v$${ver}"; \
+	  tmp="$$(mktemp -d)"; \
+	  curl -sSfL "$$base/$$bin" -o "$$tmp/osv-scanner"; \
+	  curl -sSfL "$$base/osv-scanner_SHA256SUMS" -o "$$tmp/sums.txt"; \
+	  if command -v sha256sum >/dev/null 2>&1; then sha="sha256sum"; else sha="shasum -a 256"; fi; \
+	  ( cd "$$tmp" && grep " $$bin$$" sums.txt | sed "s/$$bin/osv-scanner/" | $$sha -c - ); \
+	  install -m0755 "$$tmp/osv-scanner" /usr/local/bin/osv-scanner; \
+	  rm -rf "$$tmp"
+
+# ---------------------------------------------------------------------------
+# SBOM — syft. ARTIFACT-ONLY, NON-GATING BY DESIGN.
+# syft is a generator: it has no findings and no severity concept, so there is
+# nothing it could threshold on. It fails only if generation itself fails.
+# Do not add a fake threshold here. Gating on dependency vulns is `sca`/`trivy`.
+# Emits BOTH CycloneDX and SPDX from one scan; both upload as artifacts and are
+# what the deployment side consumes.
+SYFT_VERSION ?= 1.50.0
+sbom: bootstrap _ensure-syft
+	@set -eu; \
+	syft dir:. -o cyclonedx-json=sbom.cdx.json -o spdx-json=sbom.spdx.json; \
+	test -s sbom.cdx.json || { echo "FAIL(sbom): empty CycloneDX output"; exit 1; }; \
+	test -s sbom.spdx.json || { echo "FAIL(sbom): empty SPDX output"; exit 1; }; \
+	echo "OK(sbom): sbom.cdx.json + sbom.spdx.json generated (artifact-only, non-gating)"
+
+_ensure-syft:
+	@command -v syft >/dev/null 2>&1 && exit 0; \
+	  set -eu; \
+	  curl -sSfL https://get.anchore.io/syft | sh -s -- -b /usr/local/bin "v$(SYFT_VERSION)"
+
+# ---------------------------------------------------------------------------
+# SAST — compose this from the language-specific targets below. Each tool ships
+# its OWN rules under an OSI licence (bandit Apache-2.0, njsscan LGPLv3+), so
+# there is no rule-licensing question for these two. See the CICD README for
+# why the language-agnostic opengrep lane is NOT wired here yet.
+#
+# Compose for your stack, e.g.:
+#     sast: opengrep njsscan eslint-security bandit   # Node + Python
+#     sast: opengrep bandit           # Python / Go / C++ only
+# Opting out with `@true` is allowed but must carry a written reason — an
+# unscanned repo is a coverage gap, not a configuration choice.
+SAST_SEVERITY ?= ERROR
+sast: bootstrap
+	@echo "define: sast — compose from njsscan / bandit (see comment above)"; false
+
+# opengrep (language-agnostic). Rules are VENDORED, never fetched from a registry:
+# --config points at a local directory. `p/ci` and any semgrep.dev id would pull
+# from Semgrep Inc.'s registry under the proprietary Semgrep Rules License, which
+# forbids redistribution — and would break the air-gapped flavour outright.
+# Provenance/licence/SHA per source: rules/README.md in the CICD repo.
+#
+# OPENGREP_RULES must point OUTSIDE the tree being scanned — CI stages it under
+# $RUNNER_TEMP. Rules kept inside the scan target get scanned as source, and
+# several sources ship deliberately-vulnerable example files beside each rule.
+# Locally: `make opengrep OPENGREP_RULES=../CICD/rules`.
+OPENGREP_VERSION ?= 1.26.0
+OPENGREP_RULES ?= ./rules
+opengrep: bootstrap _ensure-opengrep
+	@set -eu; \
+	if [ ! -d "$(OPENGREP_RULES)" ]; then \
+	  echo "FAIL(opengrep): rules directory '$(OPENGREP_RULES)' not found."; \
+	  echo "  This lane MUST NOT pass without rules — a scan with no rules finds"; \
+	  echo "  nothing and would look identical to clean code."; \
+	  exit 1; \
+	fi; \
+	n=$$(find "$(OPENGREP_RULES)" -name '*.yaml' -o -name '*.yml' | wc -l | tr -d ' '); \
+	if [ "$$n" -eq 0 ]; then \
+	  echo "FAIL(opengrep): '$(OPENGREP_RULES)' contains no rule files."; exit 1; \
+	fi; \
+	echo "opengrep: $$n rule files from $(OPENGREP_RULES), gating at $(SAST_SEVERITY)"; \
+	rc=0; \
+	opengrep scan --config "$(OPENGREP_RULES)" --severity $(SAST_SEVERITY) --error \
+	  --json-output opengrep.json --disable-version-check --quiet . || rc=$$?; \
+	case "$$rc" in \
+	  0) echo "OK(opengrep): no findings at/above $(SAST_SEVERITY)";; \
+	  1) echo "FAIL(opengrep): findings at/above $(SAST_SEVERITY) — see opengrep.json"; exit 1;; \
+	  4|5) echo "FAIL(opengrep): RULE parse failure (exit $$rc). The ruleset is broken, so"; \
+	       echo "  the scan was partially blind. This is an infrastructure failure, not a"; \
+	       echo "  clean result — never treat it as a pass."; exit 1;; \
+	  *) echo "FAIL(opengrep): exit $$rc — see exit codes in opengrep/error.py."; \
+	     echo "  Not a findings result; treating as infrastructure failure."; exit 1;; \
+	esac
+
+# Upstream ships raw executables with cosign .sig/.cert but NO checksums.txt, so
+# the digests below are OURS, recorded at vendor time. Bumping OPENGREP_VERSION
+# means recomputing them; a mismatch aborts rather than running an unverified binary.
+OPENGREP_SHA256_linux_x86_64  ?= 40c21299eeddabf743b856daa843d24f9d4a027130671cd45b3b21776fd9ab26
+OPENGREP_SHA256_linux_aarch64 ?= 3042a3b1aa98fa93407b9d66a45ab1f179b5b367e76965f56afdbd2c038fb1fa
+OPENGREP_SHA256_darwin_arm64  ?= 513ff8491f7254c9a672cf8421136a537eb53b2a8af748568bd697acdc59eefe
+_ensure-opengrep:
+	@command -v opengrep >/dev/null 2>&1 && exit 0; \
+	  set -eu; ver="$(OPENGREP_VERSION)"; \
+	  os="$$(uname -s)"; arch="$$(uname -m)"; \
+	  case "$$os/$$arch" in \
+	    Linux/x86_64)  asset=opengrep_manylinux_x86;     want="$(OPENGREP_SHA256_linux_x86_64)";; \
+	    Linux/aarch64) asset=opengrep_manylinux_aarch64; want="$(OPENGREP_SHA256_linux_aarch64)";; \
+	    Darwin/arm64)  asset=opengrep_osx_arm64;         want="$(OPENGREP_SHA256_darwin_arm64)";; \
+	    *) echo "opengrep: unsupported platform $$os/$$arch"; exit 1;; \
+	  esac; \
+	  tmp="$$(mktemp -d)"; \
+	  curl -sSfL "https://github.com/opengrep/opengrep/releases/download/v$${ver}/$${asset}" -o "$$tmp/opengrep"; \
+	  if command -v sha256sum >/dev/null 2>&1; then got="$$(sha256sum "$$tmp/opengrep" | cut -d" " -f1)"; \
+	  else got="$$(shasum -a 256 "$$tmp/opengrep" | cut -d" " -f1)"; fi; \
+	  if [ "$$got" != "$$want" ]; then \
+	    echo "FAIL: opengrep checksum mismatch for $$asset"; \
+	    echo "  expected $$want"; echo "  got      $$got"; rm -rf "$$tmp"; exit 1; \
+	  fi; \
+	  install -m0755 "$$tmp/opengrep" /usr/local/bin/opengrep; \
+	  rm -rf "$$tmp"
+
+# njsscan (Node/JS/TS). Exits 1 on ERROR findings natively; WARNING-level
+# findings only fail when SAST_SEVERITY=WARNING (adds -w). Two-level tool:
+# there is no numeric threshold to tune.
+NJSSCAN_VERSION ?= 0.4.3
+njsscan: bootstrap
+	@set -eu; \
+	command -v njsscan >/dev/null 2>&1 || pip install --quiet "njsscan==$(NJSSCAN_VERSION)"; \
+	warn=""; [ "$(SAST_SEVERITY)" = "WARNING" ] && warn="-w" || true; \
+	njsscan $$warn --json -o njsscan.json . ; \
+	echo "OK(njsscan): no findings at/above $(SAST_SEVERITY)"
+
+# bandit (Python). Native threshold: fails when issues exist at/above BOTH the
+# severity and confidence levels. bandit's scale is low|medium|high, so
+# SAST_SEVERITY=ERROR maps to `high` here; override per repo if you want tighter.
+BANDIT_VERSION ?= 1.9.4
+BANDIT_SEVERITY ?= high
+BANDIT_CONFIDENCE ?= medium
+bandit: bootstrap
+	@set -eu; \
+	command -v bandit >/dev/null 2>&1 || pip install --quiet "bandit[sarif]==$(BANDIT_VERSION)"; \
+	bandit -r . -f json -o bandit.json \
+	  --severity-level $(BANDIT_SEVERITY) --confidence-level $(BANDIT_CONFIDENCE); \
+	echo "OK(bandit): no findings at/above severity=$(BANDIT_SEVERITY) confidence=$(BANDIT_CONFIDENCE)"
+
+# eslint-plugin-security (Node). Wired because our Node SAST is the THINNEST
+# coverage we have: the vendored opengrep set has only ~14 JS and ~14 TS rules,
+# and njsscan 0.4.3 is ~20 months old. This is additive, not redundant.
+#
+# Runs with a generated security-only flat config, so it does NOT inherit or
+# duplicate the repo's own `make lint` eslint config — this lane reports security
+# rules and nothing else.
+#
+# The config and its node_modules live together in a temp dir, and the REPO is
+# passed as the lint target. ESLint resolves plugin imports relative to the
+# config file, so a config in a temp dir with the packages installed elsewhere
+# (e.g. via `npx -p`) fails with ERR_MODULE_NOT_FOUND. Keep them co-located.
+#
+# ⚠️ The plugin ships all 14 rules at severity "warn". A config that just spreads
+# `recommended` therefore CANNOT FAIL — verified: an eval() + child_process
+# fixture returned "0 errors, 2 warnings" and exit 0. The generated config below
+# promotes every rule to "error" for that reason.
+#
+# Known noise: `detect-object-injection` fires on virtually any `obj[key]` and is
+# why this plugin has a bad reputation. It alone stays at "warn", so it reports
+# without gating. Promote it deliberately if you want it.
+ESLINT_VERSION ?= 10.8.0
+ESLINT_PLUGIN_SECURITY_VERSION ?= 4.0.1
+eslint-security: bootstrap
+	@set -eu; \
+	if [ ! -f package.json ]; then \
+	  echo "SKIP(eslint-security): no package.json — not a Node repo."; exit 0; \
+	fi; \
+	target="$$PWD"; \
+	d="$$(mktemp -d)"; \
+	trap 'rm -rf "$$d"' EXIT; \
+	: > "$$d/package.json"; printf '{"name":"sec","private":true,"type":"module"}' > "$$d/package.json"; \
+	( cd "$$d" && npm install --silent --no-audit --no-fund \
+	    "eslint@$(ESLINT_VERSION)" "eslint-plugin-security@$(ESLINT_PLUGIN_SECURITY_VERSION)" ); \
+	printf '%s\n' \
+	  "import security from 'eslint-plugin-security';" \
+	  "const rec = security.configs.recommended;" \
+	  "// The plugin ships EVERY rule at 'warn'. Left alone, and with warnings" \
+	  "// not failing, this lane could never go red — decoration, not a gate." \
+	  "// Promote all to 'error', then demote only the known-noisy one." \
+	  "const promoted = Object.fromEntries(" \
+	  "  Object.keys(rec.rules).map((r) => [r, 'error'])" \
+	  ");" \
+	  "export default [" \
+	  "  rec," \
+	  "  { plugins: { security }, rules: { ...promoted," \
+	  "      'security/detect-object-injection': 'warn' } }," \
+	  "];" > "$$d/eslint.security.mjs"; \
+	"$$d/node_modules/.bin/eslint" --no-config-lookup -c "$$d/eslint.security.mjs" \
+	  --max-warnings=-1 "$$target"; \
+	echo "OK(eslint-security): no eslint-plugin-security errors"
+
+# ---------------------------------------------------------------------------
+# DAST — OWASP ZAP baseline (PASSIVE only). Active scanning is too slow and too
+# destructive for a PR gate; run it on a schedule instead (not wired here).
+#
+# BOOT PATH: dast-up/dast-down MUST reuse the same boot commands as `smoke` —
+# one boot mechanism, not two. `smoke` boots-and-exits; `dast-up` boots detached
+# and leaves the service running for ZAP, `dast-down` tears it back down.
+#
+# OPT-OUT IS EXPLICIT. A repo with no bootable HTTP service sets DAST_OPT_OUT=true
+# with a reason. Leaving DAST_TARGET empty without that is a hard failure, so a
+# missing DAST config can never read as a silent pass.
+DAST_TARGET ?=
+DAST_OPT_OUT ?= false
+ZAP_VERSION ?= 2.17.0
+ZAP_IMAGE ?= ghcr.io/zaproxy/zaproxy:$(ZAP_VERSION)
+# ZAP_FAIL_ON: FAIL = fail only on ZAP FAIL-level alerts (passes -I).
+#              WARN = also fail on WARN-level alerts (omits -I). Noisy on first contact.
+ZAP_FAIL_ON ?= FAIL
+
+dast-target:
+	@printf '%s' "$(DAST_TARGET)"
+
+# Boot the service detached. Reuse your `smoke` boot commands here, e.g.:
+#   docker run -d --name dast -p 8080:8080 $(IMAGE) && \
+#   for i in $$(seq 1 30); do curl -fsS $(DAST_TARGET)/health && exit 0; sleep 2; done; exit 1
+dast-up:
+	@if [ "$(DAST_OPT_OUT)" = "true" ]; then exit 0; fi; \
+	  echo "define: dast-up (boot detached, reusing your smoke boot) — or set DAST_OPT_OUT=true with a reason"; false
+
+# Tear the service back down. Trap: a naive `pkill -f "<pattern>"` matches this
+# recipe's OWN shell (the pattern is in its command line) and kills itself, so
+# the target exits non-zero and reds the lane. Use a PID file or `docker rm -f`.
+dast-down:
+	@true
+
+# ---------------------------------------------------------------------------
+# VERSION RESOLUTION CHECK — every pinned version must still be DOWNLOADABLE.
+#
+# This exists because trivy 0.55.0 was pinned here for months after aquasecurity
+# DELETED that release. `_ensure-trivy` 404'd, and since `security / trivy` is a
+# REQUIRED check it would have hard-blocked every PR in every repo. Nobody
+# noticed because CI never ran. A pin is not permanent.
+#
+# !! IT CHECKS THE ASSET URL, NOT THE TAG PAGE. This is load-bearing and was got
+# wrong first time round: github.com/OWNER/REPO/releases/tag/vX returns 200 for a
+# DELETED release, because the underlying git tag survives. The first version of
+# this target checked exactly that, and so reported OK on trivy 0.55.0 — the very
+# pin it was written to catch. Verify what the installer actually downloads.
+#
+# Resolution only, NOT staleness — Dependabot covers "is there something newer".
+versions-check:
+	@set -eu; fail=0; \
+	url() { \
+	  code=$$(curl -s -o /dev/null -w '%{http_code}' -L "$$2"); \
+	  if [ "$$code" = "200" ]; then printf '  OK    %-14s %-10s\n' "$$1" "$$3"; \
+	  else printf '  GONE  %-14s %-10s HTTP %s\n     %s\n' "$$1" "$$3" "$$code" "$$2"; fail=1; fi; }; \
+	echo "Resolving pinned versions by fetching what the installers actually download:"; \
+	url trivy       "https://github.com/aquasecurity/trivy/releases/download/v$(TRIVY_VERSION)/trivy_$(TRIVY_VERSION)_checksums.txt" "$(TRIVY_VERSION)"; \
+	url gitleaks    "https://github.com/gitleaks/gitleaks/releases/download/v$(GITLEAKS_VERSION)/gitleaks_$(GITLEAKS_VERSION)_checksums.txt" "$(GITLEAKS_VERSION)"; \
+	url osv-scanner "https://github.com/google/osv-scanner/releases/download/v$(OSV_VERSION)/osv-scanner_SHA256SUMS" "$(OSV_VERSION)"; \
+	url syft        "https://github.com/anchore/syft/releases/download/v$(SYFT_VERSION)/syft_$(SYFT_VERSION)_checksums.txt" "$(SYFT_VERSION)"; \
+	url opengrep    "https://github.com/opengrep/opengrep/releases/download/v$(OPENGREP_VERSION)/opengrep_manylinux_x86" "$(OPENGREP_VERSION)"; \
+	url bandit      "https://pypi.org/pypi/bandit/$(BANDIT_VERSION)/json" "$(BANDIT_VERSION)"; \
+	url njsscan     "https://pypi.org/pypi/njsscan/$(NJSSCAN_VERSION)/json" "$(NJSSCAN_VERSION)"; \
+	tok=$$(curl -s "https://ghcr.io/token?scope=repository:zaproxy/zaproxy:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
+	code=$$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $$tok" \
+	  -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+	  "https://ghcr.io/v2/zaproxy/zaproxy/manifests/$(ZAP_VERSION)"); \
+	if [ "$$code" = "200" ]; then printf '  OK    %-14s %-10s\n' "zap-image" "$(ZAP_VERSION)"; \
+	else printf '  GONE  %-14s %-10s HTTP %s (ghcr manifest)\n' "zap-image" "$(ZAP_VERSION)" "$$code"; fail=1; fi; \
+	if [ "$$fail" -ne 0 ]; then \
+	  echo; echo "FAIL(versions-check): a pinned version is no longer downloadable."; \
+	  echo "  The lane that installs it will 404. If that lane is a required check,"; \
+	  echo "  it hard-blocks every PR in every consuming repo. Repin and re-run."; \
+	  exit 1; \
+	fi; \
+	echo; echo "OK(versions-check): all pinned versions resolve upstream"
