@@ -2,6 +2,8 @@
 # (default read-only token) can call it with no permission grant.
 #   secrets — gitleaks, language-agnostic, ALWAYS runs. Gates.
 #   trivy   — OS-package + lockfile vuln scan via `make trivy`. Gates.
+#   trivy-image — scans the BUILT IMAGE via `make trivy-image`. Gates.
+#   versions— every pinned tool version still downloadable. Gates.
 #   sast    — opengrep (vendored rules) + njsscan/bandit. Gates at SAST_SEVERITY.
 #   sca     — osv-scanner lockfile vulns via `make sca`. Gates at sca-severity.
 #   sbom    — syft CycloneDX + SPDX via `make sbom`. ARTIFACT-ONLY, NON-GATING.
@@ -34,7 +36,11 @@ on:
         description: Runner label.
       gitleaks-version:
         type: string
-        default: "8.18.4"
+        default: "8.30.1"
+      trivy-image-severity:
+        type: string
+        default: "CRITICAL"
+        description: 'Container-image gate. CRITICAL | HIGH | MEDIUM | LOW.'
       trivy-version:
         type: string
         default: "0.72.0"
@@ -96,7 +102,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
       - name: gitleaks
@@ -116,24 +122,28 @@ jobs:
           curl -sSfL "$base/gitleaks_${GL_VERSION}_checksums.txt" -o gl_sums.txt
           grep " $tar$" gl_sums.txt | sha256sum -c -
           tar -xzf "$tar" gitleaks
+          # `detect`/`protect` were replaced by `git`/`dir` in gitleaks v8.19+.
+          # `detect` still works as a HIDDEN alias (absent from --help), so a blind
+          # version bump would not have broken loudly — it would have kept working
+          # until it silently didn't. Use the supported surface instead.
           if [ "$EVENT" = "pull_request" ]; then
             echo "scanning PR range ${BASE_SHA}..${HEAD_SHA}"
-            ./gitleaks detect --redact --no-banner --exit-code 1 \
+            ./gitleaks git . --redact --no-banner --exit-code 1 \
               --log-opts="--no-merges ${BASE_SHA}..${HEAD_SHA}"
           else
             echo "scanning full history"
-            ./gitleaks detect --source . --redact --no-banner --exit-code 1
+            ./gitleaks git . --redact --no-banner --exit-code 1
           fi
 
   trivy:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - id: dbkey
         run: echo "week=$(date +%Y-%U)" >> "$GITHUB_OUTPUT"
       - name: cache trivy vuln DB (weekly key — the slow part)
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: ~/.cache/trivy
           key: trivy-db-${{ steps.dbkey.outputs.week }}
@@ -147,13 +157,13 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       # Rules are VENDORED in this repo and pulled in here, never fetched from a
       # rule registry at scan time: the semgrep.dev registry is under a proprietary
       # licence forbidding redistribution, and a network fetch cannot work air-gapped.
       # Provenance, licence and commit SHA per source: rules/README.md.
       - name: fetch vendored SAST rules (pinned)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           repository: ${{ inputs.rules-repo }}
           ref: ${{ inputs.rules-ref }}
@@ -169,7 +179,7 @@ jobs:
         run: make sast
       - name: upload sast reports
         if: always() # findings are the reason the job failed — always publish them
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: sast-reports
           path: |
@@ -183,7 +193,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: sca (adapter — osv-scanner + our severity/fixable filter)
         env:
           SCA_SEVERITY: ${{ inputs.sca-severity }}
@@ -192,7 +202,7 @@ jobs:
         run: make sca
       - name: upload sca report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: sca-report
           path: osv.json
@@ -205,14 +215,14 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: sbom (syft — CycloneDX + SPDX)
         env:
           SYFT_VERSION: ${{ inputs.syft-version }}
         run: make sbom
       - name: upload sbom
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: sbom
           path: |
@@ -220,3 +230,40 @@ jobs:
             sbom.spdx.json
           if-no-files-found: error # an empty SBOM lane would be pure decoration
           retention-days: 90
+
+  # Scans the BUILT IMAGE — base-image OS packages and anything installed during
+  # the build, none of which `trivy fs` can see. A repo that builds no image must
+  # opt out explicitly in its Makefile (TRIVY_IMAGE_OPT_OUT=true) with a reason;
+  # an unset IMAGE hard-fails rather than passing on an empty scan.
+  trivy-image:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: build the image the scan will target
+        run: make build
+      - name: trivy image scan (adapter)
+        env:
+          TRIVY_VERSION: ${{ inputs.trivy-version }}
+          TRIVY_IMAGE_SEVERITY: ${{ inputs.trivy-image-severity }}
+        run: make trivy-image
+
+  # Asserts every pinned tool version is still DOWNLOADABLE upstream.
+  # This is the control that would have caught trivy 0.55.0 — a release deleted
+  # by aquasecurity while it was pinned here, which 404'd the already-required
+  # `security / trivy` check. Resolution only; Dependabot covers staleness.
+  versions:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: every pinned version still resolves
+        env:
+          TRIVY_VERSION: ${{ inputs.trivy-version }}
+          GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+          OSV_VERSION: ${{ inputs.osv-scanner-version }}
+          SYFT_VERSION: ${{ inputs.syft-version }}
+          OPENGREP_VERSION: ${{ inputs.opengrep-version }}
+          BANDIT_VERSION: ${{ inputs.bandit-version }}
+          NJSSCAN_VERSION: ${{ inputs.njsscan-version }}
+        run: make versions-check

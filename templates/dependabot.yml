@@ -1,0 +1,66 @@
+# Copy to each repo as .github/dependabot.yml, then DELETE the ecosystems the
+# repo does not use. Leaving an ecosystem with no manifest is harmless but noisy.
+#
+# WHY THIS MATTERS MORE THAN IT LOOKS: Dependabot runs on GitHub's side. It needs
+# no runner and burns no Actions minutes, so it is unaffected by the org's $0
+# spending limit that currently stops CI from running at all. While CI is
+# unfunded, this is the only dependency control that actually executes.
+#
+# ⚠️ ENABLING IS A PER-REPO SETTING THE ORG OWNER MUST SWITCH ON. This file alone
+# does nothing until Dependabot is enabled for the repo (Settings → Code security
+# → Dependabot security updates / version updates, or org-wide default). A
+# committed config with the feature disabled is the "documented but off" pattern —
+# verify it is actually on, per repo.
+#
+# Security updates (CVE-driven) are a SEPARATE toggle from version updates
+# (staleness-driven) and are the higher-value one. Turn both on.
+version: 2
+updates:
+  # --- GitHub Actions: every repo has these, keep this block ------------------
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(actions)"
+    labels: ["dependencies"]
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # --- Node ------------------------------------------------------------------
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+    labels: ["dependencies"]
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # --- Python ----------------------------------------------------------------
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    labels: ["dependencies"]
+    groups:
+      pip-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # --- Container base images (uncomment if the repo has a Dockerfile) ---------
+  # - package-ecosystem: docker
+  #   directory: "/"
+  #   schedule:
+  #     interval: weekly
+  #   commit-message:
+  #     prefix: "chore(docker)"
+  #   labels: ["dependencies"]

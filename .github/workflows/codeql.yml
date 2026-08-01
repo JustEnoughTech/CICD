@@ -26,10 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: actions/checkout@v7.0.1
+      - uses: github/codeql-action/init@v3.37.4
         with:
           languages: ${{ inputs.languages }}
           queries: security-extended
-      - uses: github/codeql-action/autobuild@v3
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/autobuild@v3.37.4
+      - uses: github/codeql-action/analyze@v3.37.4

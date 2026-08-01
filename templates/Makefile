@@ -6,6 +6,7 @@
 # never needs stack-specific setup steps.
 .PHONY: bootstrap lint format-check format test e2e build smoke trivy secrets hooks \
         sast opengrep njsscan bandit sca sbom dast dast-target dast-up dast-down \
+        versions-check trivy-image eslint-security \
         _ensure-trivy _ensure-gitleaks _ensure-osv _ensure-syft _ensure-opengrep
 
 # Install deps / toolchain. Examples:
@@ -68,6 +69,38 @@ trivy: bootstrap _ensure-trivy
 #	trivy fs --scanners vuln,misconfig,secret \
 #	  --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress .
 
+# Container SCA — scans the BUILT IMAGE, which `trivy fs` cannot see: base-image
+# OS packages, and anything installed during the build rather than declared in a
+# lockfile. For most services this is the larger attack surface of the two.
+#
+# Set IMAGE to what `make build` produces. A repo that builds no image must set
+# TRIVY_IMAGE_OPT_OUT=true WITH a reason — an unset IMAGE hard-fails, so "we
+# never wired this up" can never read as a pass. Same contract as DAST.
+IMAGE ?=
+TRIVY_IMAGE_OPT_OUT ?= false
+# No _ensure-trivy prerequisite on purpose: the opt-out path must not install a
+# tool it will never run. The install happens below, only when we actually scan.
+trivy-image:
+	@set -eu; \
+	if [ -z "$(IMAGE)" ]; then \
+	  if [ "$(TRIVY_IMAGE_OPT_OUT)" = "true" ]; then \
+	    echo "SKIP(trivy-image): repo builds no container image (TRIVY_IMAGE_OPT_OUT=true)."; \
+	    echo "  Explicit opt-out with a stated reason, NOT a clean scan result."; \
+	    exit 0; \
+	  fi; \
+	  echo "FAIL(trivy-image): IMAGE is not set and TRIVY_IMAGE_OPT_OUT is not true."; \
+	  echo "  Set IMAGE to the tag \`make build\` produces, or opt out explicitly."; \
+	  echo "  Refusing to pass silently: a container lane that scans nothing looks"; \
+	  echo "  identical to a container with no vulnerabilities."; \
+	  exit 1; \
+	fi; \
+	$(MAKE) -s -f $(firstword $(MAKEFILE_LIST)) _ensure-trivy; \
+	echo "trivy-image: scanning $(IMAGE) at $(TRIVY_IMAGE_SEVERITY), fixable only"; \
+	trivy image --scanners vuln --severity $(TRIVY_IMAGE_SEVERITY) \
+	  --ignore-unfixed --exit-code 1 --no-progress "$(IMAGE)"; \
+	echo "OK(trivy-image): no fixable vulnerabilities at/above $(TRIVY_IMAGE_SEVERITY) in $(IMAGE)"
+TRIVY_IMAGE_SEVERITY ?= CRITICAL
+
 # Pinned, checksum-verified trivy install. Self-guards: no-op when trivy is
 # present (devs with `brew install trivy`), installs only in CI.
 #
@@ -94,9 +127,11 @@ _ensure-trivy:
 
 # Local secret scan for the pre-commit hook: scans STAGED changes only (fast).
 # CI scans history/PR-range separately (see security.yml). Same tool, different mode.
-GITLEAKS_VERSION ?= 8.18.4
+GITLEAKS_VERSION ?= 8.30.1
+# `protect --staged` became `git --staged` in gitleaks v8.19+. The old spelling
+# still resolves as a hidden alias, so this change is about not depending on one.
 secrets: _ensure-gitleaks
-	gitleaks protect --staged --redact --no-banner --exit-code 1
+	gitleaks git --staged . --redact --no-banner --exit-code 1
 
 _ensure-gitleaks:
 	@command -v gitleaks >/dev/null 2>&1 && exit 0; \
@@ -216,7 +251,7 @@ _ensure-syft:
 # why the language-agnostic opengrep lane is NOT wired here yet.
 #
 # Compose for your stack, e.g.:
-#     sast: opengrep njsscan bandit   # Node + Python, plus the vendored ruleset
+#     sast: opengrep njsscan eslint-security bandit   # Node + Python
 #     sast: opengrep bandit           # Python / Go / C++ only
 # Opting out with `@true` is allowed but must carry a written reason — an
 # unscanned repo is a coverage gap, not a configuration choice.
@@ -311,6 +346,35 @@ bandit: bootstrap
 	  --severity-level $(BANDIT_SEVERITY) --confidence-level $(BANDIT_CONFIDENCE); \
 	echo "OK(bandit): no findings at/above severity=$(BANDIT_SEVERITY) confidence=$(BANDIT_CONFIDENCE)"
 
+# eslint-plugin-security (Node). Wired because our Node SAST is the THINNEST
+# coverage we have: the vendored opengrep set has only ~14 JS and ~14 TS rules,
+# and njsscan 0.4.3 is ~20 months old. This is additive, not redundant.
+#
+# Runs with a generated security-only flat config, so it does NOT inherit or
+# duplicate the repo's own `make lint` eslint config — this lane reports security
+# rules and nothing else.
+#
+# Known noise: `detect-object-injection` fires on virtually any `obj[key]` and is
+# the reason this plugin has a bad reputation. It is set to "warn" below and so
+# does not gate; everything else errors. Re-enable it deliberately if you want it.
+ESLINT_VERSION ?= 10.8.0
+ESLINT_PLUGIN_SECURITY_VERSION ?= 4.0.1
+eslint-security: bootstrap
+	@set -eu; \
+	if [ ! -f package.json ]; then \
+	  echo "SKIP(eslint-security): no package.json — not a Node repo."; exit 0; \
+	fi; \
+	cfg="$$(mktemp -d)/eslint.security.mjs"; \
+	printf '%s\n' \
+	  "import security from 'eslint-plugin-security';" \
+	  "export default [" \
+	  "  security.configs.recommended," \
+	  "  { rules: { 'security/detect-object-injection': 'warn' } }," \
+	  "];" > "$$cfg"; \
+	npx --yes -p eslint@$(ESLINT_VERSION) -p eslint-plugin-security@$(ESLINT_PLUGIN_SECURITY_VERSION) \
+	  eslint --no-config-lookup -c "$$cfg" --max-warnings=-1 . ; \
+	echo "OK(eslint-security): no eslint-plugin-security errors"
+
 # ---------------------------------------------------------------------------
 # DAST — OWASP ZAP baseline (PASSIVE only). Active scanning is too slow and too
 # destructive for a PR gate; run it on a schedule instead (not wired here).
@@ -324,7 +388,8 @@ bandit: bootstrap
 # missing DAST config can never read as a silent pass.
 DAST_TARGET ?=
 DAST_OPT_OUT ?= false
-ZAP_IMAGE ?= ghcr.io/zaproxy/zaproxy:stable
+ZAP_VERSION ?= 2.17.0
+ZAP_IMAGE ?= ghcr.io/zaproxy/zaproxy:$(ZAP_VERSION)
 # ZAP_FAIL_ON: FAIL = fail only on ZAP FAIL-level alerts (passes -I).
 #              WARN = also fail on WARN-level alerts (omits -I). Noisy on first contact.
 ZAP_FAIL_ON ?= FAIL
@@ -344,3 +409,46 @@ dast-up:
 # the target exits non-zero and reds the lane. Use a PID file or `docker rm -f`.
 dast-down:
 	@true
+
+# ---------------------------------------------------------------------------
+# VERSION RESOLUTION CHECK — every pinned version must still be DOWNLOADABLE.
+#
+# This exists because trivy 0.55.0 was pinned here for months after aquasecurity
+# DELETED that release. `_ensure-trivy` 404'd, and since `security / trivy` is a
+# REQUIRED check it would have hard-blocked every PR in every repo. Nobody
+# noticed because CI never ran. A pin is not permanent.
+#
+# !! IT CHECKS THE ASSET URL, NOT THE TAG PAGE. This is load-bearing and was got
+# wrong first time round: github.com/OWNER/REPO/releases/tag/vX returns 200 for a
+# DELETED release, because the underlying git tag survives. The first version of
+# this target checked exactly that, and so reported OK on trivy 0.55.0 — the very
+# pin it was written to catch. Verify what the installer actually downloads.
+#
+# Resolution only, NOT staleness — Dependabot covers "is there something newer".
+versions-check:
+	@set -eu; fail=0; \
+	url() { \
+	  code=$$(curl -s -o /dev/null -w '%{http_code}' -L "$$2"); \
+	  if [ "$$code" = "200" ]; then printf '  OK    %-14s %-10s\n' "$$1" "$$3"; \
+	  else printf '  GONE  %-14s %-10s HTTP %s\n     %s\n' "$$1" "$$3" "$$code" "$$2"; fail=1; fi; }; \
+	echo "Resolving pinned versions by fetching what the installers actually download:"; \
+	url trivy       "https://github.com/aquasecurity/trivy/releases/download/v$(TRIVY_VERSION)/trivy_$(TRIVY_VERSION)_checksums.txt" "$(TRIVY_VERSION)"; \
+	url gitleaks    "https://github.com/gitleaks/gitleaks/releases/download/v$(GITLEAKS_VERSION)/gitleaks_$(GITLEAKS_VERSION)_checksums.txt" "$(GITLEAKS_VERSION)"; \
+	url osv-scanner "https://github.com/google/osv-scanner/releases/download/v$(OSV_VERSION)/osv-scanner_SHA256SUMS" "$(OSV_VERSION)"; \
+	url syft        "https://github.com/anchore/syft/releases/download/v$(SYFT_VERSION)/syft_$(SYFT_VERSION)_checksums.txt" "$(SYFT_VERSION)"; \
+	url opengrep    "https://github.com/opengrep/opengrep/releases/download/v$(OPENGREP_VERSION)/opengrep_manylinux_x86" "$(OPENGREP_VERSION)"; \
+	url bandit      "https://pypi.org/pypi/bandit/$(BANDIT_VERSION)/json" "$(BANDIT_VERSION)"; \
+	url njsscan     "https://pypi.org/pypi/njsscan/$(NJSSCAN_VERSION)/json" "$(NJSSCAN_VERSION)"; \
+	tok=$$(curl -s "https://ghcr.io/token?scope=repository:zaproxy/zaproxy:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
+	code=$$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $$tok" \
+	  -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+	  "https://ghcr.io/v2/zaproxy/zaproxy/manifests/$(ZAP_VERSION)"); \
+	if [ "$$code" = "200" ]; then printf '  OK    %-14s %-10s\n' "zap-image" "$(ZAP_VERSION)"; \
+	else printf '  GONE  %-14s %-10s HTTP %s (ghcr manifest)\n' "zap-image" "$(ZAP_VERSION)" "$$code"; fail=1; fi; \
+	if [ "$$fail" -ne 0 ]; then \
+	  echo; echo "FAIL(versions-check): a pinned version is no longer downloadable."; \
+	  echo "  The lane that installs it will 404. If that lane is a required check,"; \
+	  echo "  it hard-blocks every PR in every consuming repo. Repin and re-run."; \
+	  exit 1; \
+	fi; \
+	echo; echo "OK(versions-check): all pinned versions resolve upstream"
