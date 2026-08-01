@@ -1,14 +1,28 @@
 # Reusable security scan — lanes that need only `contents: read`, so any caller
 # (default read-only token) can call it with no permission grant.
-#   secrets — gitleaks, language-agnostic, ALWAYS runs. Mandatory gate.
-#   trivy   — vuln scan via `make trivy` (adapter). Mandatory gate.
+#   secrets — gitleaks, language-agnostic, ALWAYS runs. Gates.
+#   trivy   — OS-package + lockfile vuln scan via `make trivy`. Gates.
+#   sast    — njsscan/bandit via `make sast`. Gates at SAST_SEVERITY.
+#   sca     — osv-scanner lockfile vulns via `make sca`. Gates at sca-severity.
+#   sbom    — syft CycloneDX + SPDX via `make sbom`. ARTIFACT-ONLY, NON-GATING.
+#
+# Every lane either gates on a stated threshold or is documented artifact-only.
+# There is no third category. `sbom` is the only artifact-only lane here: syft
+# is a generator with no findings and no severity concept, so a threshold on it
+# would be decoration. It fails only if generation itself fails.
+#
 # CodeQL lives in a SEPARATE opt-in workflow (codeql.yml) because it needs
 # security-events:write — bundling it here made every caller hit a startup
-# escalation error.
+# escalation error. For the same reason there is NO SARIF upload anywhere here:
+# github/codeql-action/upload-sarif needs GHAS on private repos and would 403.
+# Findings travel as workflow artifacts; the gate is the exit code.
 #
 # Check contexts produced:
-#   security / secrets   (require this in the ruleset)
-#   security / trivy     (require this in the ruleset)
+#   security / secrets   (already required in the ruleset)
+#   security / trivy     (already required in the ruleset)
+#   security / sast      (NOT yet in rulesets/ — see README "Adding these to the ruleset")
+#   security / sca       (NOT yet in rulesets/ — see README)
+#   security / sbom      (NOT yet in rulesets/ — see README)
 name: Security
 
 on:
@@ -21,6 +35,35 @@ on:
       gitleaks-version:
         type: string
         default: "8.18.4"
+      # --- SAST -------------------------------------------------------------
+      sast-severity:
+        type: string
+        default: "ERROR"
+        description: 'Fail at/above this level. ERROR | WARNING.'
+      njsscan-version:
+        type: string
+        default: "0.4.3"
+      bandit-version:
+        type: string
+        default: "1.9.4"
+      # --- SCA --------------------------------------------------------------
+      sca-severity:
+        type: string
+        default: "CRITICAL"
+        description: 'Fail at/above this severity. CRITICAL | HIGH | MEDIUM | LOW.'
+      sca-fixable-only:
+        type: boolean
+        default: true
+        description: >-
+          Only fail on vulns that HAVE a fix. An unfixable upstream CVE would
+          otherwise block every merge with no available remediation.
+      osv-scanner-version:
+        type: string
+        default: "2.4.0"
+      # --- SBOM -------------------------------------------------------------
+      syft-version:
+        type: string
+        default: "1.50.0"
 
 permissions:
   contents: read
@@ -78,3 +121,67 @@ jobs:
           restore-keys: trivy-db-
       - name: trivy scan (adapter — repo's `make trivy` owns fs-vs-image, severity)
         run: make trivy
+
+  sast:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: sast (adapter — repo's `make sast` composes njsscan/bandit for its stack)
+        env:
+          SAST_SEVERITY: ${{ inputs.sast-severity }}
+          NJSSCAN_VERSION: ${{ inputs.njsscan-version }}
+          BANDIT_VERSION: ${{ inputs.bandit-version }}
+        run: make sast
+      - name: upload sast reports
+        if: always() # findings are the reason the job failed — always publish them
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: |
+            njsscan.json
+            bandit.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  sca:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: sca (adapter — osv-scanner + our severity/fixable filter)
+        env:
+          SCA_SEVERITY: ${{ inputs.sca-severity }}
+          SCA_FIXABLE_ONLY: ${{ inputs.sca-fixable-only }}
+          OSV_VERSION: ${{ inputs.osv-scanner-version }}
+        run: make sca
+      - name: upload sca report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-report
+          path: osv.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ARTIFACT-ONLY, NON-GATING. syft has no findings and no severity concept.
+  # This lane fails only if SBOM generation itself fails. Do not add a threshold.
+  sbom:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: sbom (syft — CycloneDX + SPDX)
+        env:
+          SYFT_VERSION: ${{ inputs.syft-version }}
+        run: make sbom
+      - name: upload sbom
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom.cdx.json
+            sbom.spdx.json
+          if-no-files-found: error # an empty SBOM lane would be pure decoration
+          retention-days: 90
