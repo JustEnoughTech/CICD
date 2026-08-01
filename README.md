@@ -22,9 +22,11 @@ third category — a scanner that only warns is decoration.
 |---|---|---|---|---|
 | `security / secrets` | gitleaks | *(in-workflow)* | any secret in the PR range | — |
 | `security / trivy` | trivy | `trivy` | fixable `HIGH,CRITICAL` | *(in the Makefile)* |
-| `security / sast` | njsscan (Node), bandit (Python) | `sast` | findings ≥ `ERROR` | `sast-severity` |
+| `security / sast` | opengrep (vendored rules), njsscan, bandit, eslint-plugin-security | `sast` | findings ≥ `ERROR` | `sast-severity` |
 | `security / sca` | osv-scanner | `sca` | **fixable** vulns ≥ `CRITICAL` | `sca-severity`, `sca-fixable-only` |
 | `security / sbom` | syft | `sbom` | **nothing — artifact-only** | *(none by design)* |
+| `security / trivy-image` | trivy | `trivy-image` | fixable `CRITICAL` in the built image | `trivy-image-severity` |
+| `security / versions` | curl | `versions-check` | any pinned version no longer downloadable | *(n/a)* |
 | `ci / dast` | OWASP ZAP baseline | `dast-up` / `dast-down` | ZAP `FAIL`-level alerts | `zap-fail-on` |
 
 Every tool version is also an input (`trivy-version`, `osv-scanner-version`, `syft-version`,
@@ -49,6 +51,50 @@ Lanes that cannot run must say so out loud. None of these is a silent pass:
   reason. Leaving `DAST_TARGET` unset **hard-fails**, so a missing config can't read as green.
 - **`dast` with an unreachable target** — ZAP exit `3` means nothing was scanned. That is an
   **infrastructure failure, red**, never a clean pass.
+- **`trivy-image` with no image** — the repo must set `TRIVY_IMAGE_OPT_OUT=true` with a reason.
+  An unset `IMAGE` **hard-fails**: a container lane that scans nothing looks exactly like a
+  container with no vulnerabilities.
+- **`sast` with a missing or empty rules directory** — hard-fails. A scan with no rules finds
+  nothing and is indistinguishable from clean code.
+
+### What `ci / dast` actually buys you today
+
+Be clear-eyed about this one. ZAP's baseline profile marks almost nothing as `FAIL` by default,
+so with `zap-fail-on: FAIL` the lane tolerates the WARN-level findings a typical service produces
+(missing CSP, `X-Content-Type-Options`, clickjacking headers). **Its proven value today is
+catching a service that does not come up at all** (ZAP exit 3) — real, but modest. This is
+passive scanning only; it is **not** full dynamic coverage and should not be read as such.
+Giving the lane teeth means a ZAP rules config promoting specific rules to `FAIL`; that is a
+filed follow-up, not something this pipeline does yet.
+
+## Runner prerequisites
+
+All lanes were proven on GitHub-hosted `ubuntu-latest`. The 15 GT repos will run on a
+**self-hosted runner**, so its image must provide:
+
+| Requirement | Needed by | Why |
+|---|---|---|
+| **Actions runner ≥ v2.329.0** | checkout v7, upload-artifact v7, cache v6 | v2.327.1 is the Node 24 floor — below it **all three actions fail**, not just one. v2.329.0 additionally covers checkout v6's credential-file change for Docker container actions. |
+| `docker` (daemon reachable) | `ci / dast`, `security / trivy-image` | ZAP runs as a container; the image scan needs a built image. |
+| `python3` + `pip` | `security / sast` | bandit, njsscan. |
+| `node` + `npx` | `security / sast` | eslint-plugin-security. |
+| write access to `/usr/local/bin` | trivy, syft, osv-scanner, opengrep, gitleaks | the pinned-installer targets install there. |
+| `curl`, `jq`, `git`, `make` | everything | assumed present. |
+
+`actions/upload-artifact@v4+` is **not supported on GHES** — if that runner attaches to a GitHub
+Enterprise Server instance, artifacts need a different approach.
+
+## Dependabot
+
+`templates/dependabot.yml` (consumers: actions/npm/pip) and `.github/dependabot.yml` (this repo:
+actions). It runs **GitHub-side — no runner, no Actions minutes**, so it is unaffected by the org's
+`$0` spending limit. While CI is unfunded, it is the only dependency control that actually
+executes.
+
+⚠️ **Committing the file does not enable it.** Dependabot is a per-repo (or org-default) setting
+the owner must switch on — *Settings → Code security*. Version updates and security updates are
+**separate toggles**; turn both on. A config file with the feature disabled is exactly the
+"documented but off" pattern this repo drops lanes to avoid, so verify it per repo.
 
 ## Deliberately NOT here
 
@@ -65,16 +111,28 @@ Lanes that cannot run must say so out loud. None of these is a silent pass:
   `attestations: write`, so it lands in its own opt-in `supply-chain.yml`, **together with the
   verifier that consumes it**. Building an attestation nothing verifies is unverified
   machinery — the same trap as a gate never observed failing.
-- **No opengrep lane yet — blocked on rule licensing, not on the engine.** The opengrep engine
-  is LGPL-2.1 and genuinely free. Its *rules* are the problem. `semgrep/semgrep-rules` was
-  relicensed on **2024-12-13** to the proprietary **Semgrep Rules License v1.0** ("You may use
-  the rules only for your own internal business purposes… does not allow you to distribute the
-  rules"), which forbids vendoring them into **this public repo**. Before that it was LGPL-2.1
-  **+ Commons Clause** — never plain LGPL, and never OSI-approved. `opengrep/opengrep-rules` is
-  archived, self-contradictory on licensing, and self-described as for research only. Clean
-  MIT-licensed alternatives exist (apiiro, elttam, dgryski/semgrep-go, 0xdea) and are the
-  intended path; wiring them is a follow-up. **`sast` is not empty in the meantime** — bandit
-  (Apache-2.0) and njsscan (LGPLv3+) ship their own rules with no licensing question.
+- **No CodeQL in any mandatory path.** The GT repos are private, and CodeQL's licence forbids use
+  on non-open-source code without GitHub Advanced Security. `codeql.yml` stays opt-in.
+
+## SAST coverage — what it is and is not
+
+The opengrep lane runs **245 vendored rules from four MIT-licensed sources**, pinned by commit
+SHA with per-source licence provenance in [`rules/README.md`](rules/README.md). **123 of them are
+`ERROR` severity and can therefore fail a build**; the rest report into the artifact only.
+
+Rules are **vendored, never fetched**. `--config p/ci` would resolve to Semgrep Inc.'s registry
+under the proprietary **Semgrep Rules License v1.0** (*"only for your own internal business
+purposes… does not allow you to distribute the rules"*) — which also rules out
+`semgrep/semgrep-rules` itself, relicensed to those same terms on 2024-12-13 and never plain
+LGPL-2.1 before that (it was LGPL-2.1 **+ Commons Clause**). A registry fetch also cannot work in
+the air-gapped delivery flavour.
+
+**This is a deliberate, auditable subset — not parity with the Semgrep registry**, which carries
+thousands of rules. Coverage is uneven by design of what is available under MIT: Go, C/C++ and
+malicious-code/obfuscation patterns are well covered; **Python, JS/TS and C# are thin**, which is
+why `sast` also runs bandit (Python), njsscan and eslint-plugin-security (Node). There is no
+broad language-agnostic injection ruleset. Buying registry breadth is a **licensing decision to
+be made consciously**, not a gap to close by quietly re-adding `p/ci`.
 
 ## Adding these to the ruleset
 
@@ -89,6 +147,8 @@ context strings to `required_status_checks` in `rulesets/01-branch-default.json`
 security / sast
 security / sca
 security / sbom
+security / trivy-image
+security / versions
 ci / dast
 ```
 
