@@ -276,5 +276,8 @@ dast-up:
 	@if [ "$(DAST_OPT_OUT)" = "true" ]; then exit 0; fi; \
 	  echo "define: dast-up (boot detached, reusing your smoke boot) — or set DAST_OPT_OUT=true with a reason"; false
 
+# Tear the service back down. Trap: a naive `pkill -f "<pattern>"` matches this
+# recipe's OWN shell (the pattern is in its command line) and kills itself, so
+# the target exits non-zero and reds the lane. Use a PID file or `docker rm -f`.
 dast-down:
 	@true

@@ -1,5 +1,8 @@
 # Copy to each repo as .github/workflows/ci.yml
-# Produces required checks: ci / lint, ci / format, ci / test, ci / e2e, ci / build
+# Produces checks: ci / lint, ci / format, ci / test, ci / e2e, ci / build, ci / dast
+# ci / dast is NOT required by the ruleset yet — see the CICD README.
+# A repo with no bootable HTTP service must set DAST_OPT_OUT=true in its
+# Makefile WITH a reason; leaving DAST_TARGET unset hard-fails on purpose.
 #
 # PR-only trigger (Lever 2, min CI minutes): no `push` trigger — direct pushes to
 # main are blocked by the ruleset anyway, and per-branch push runs just duplicate
@@ -19,3 +22,4 @@ jobs:
     # with:
     #   runner: ubuntu-latest
     #   timeout-minutes: 20
+    #   zap-fail-on: FAIL        # WARN also fails on WARN-level alerts (noisy at first)
