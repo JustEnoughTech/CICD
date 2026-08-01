@@ -151,12 +151,14 @@ sca: bootstrap _ensure-osv
 	test -s osv.json || { echo "FAIL(sca): osv-scanner produced no report (exit $$rc)"; exit 1; }; \
 	fixable='true'; [ "$(SCA_FIXABLE_ONLY)" = "true" ] || fixable='false'; \
 	hits=$$(jq --argjson min "$$min" --argjson fixonly "$$fixable" -r ' \
-	  [ .results[]?.packages[]? as $$p \
+	  [ .results[]?.packages[]? \
+	    | . as $$p \
 	    | $$p.groups[]? \
-	    | select((.max_severity // "0") | tonumber >= $$min) \
+	    | select((((.max_severity // "") | if . == "" then "0" else . end) | tonumber) >= $$min) \
 	    | . as $$g \
-	    | ($$p.vulnerabilities[]? | select(.id as $$i | $$g.ids | index($$i))) \
-	    | select($$fixonly | not or ([.affected[]?.ranges[]?.events[]? | select(has("fixed"))] | length > 0)) \
+	    | $$p.vulnerabilities[]? \
+	    | select(.id as $$i | $$g.ids | index($$i)) \
+	    | select(($$fixonly | not) or ([.affected[]?.ranges[]?.events[]? | select(has("fixed"))] | length > 0)) \
 	    | "\($$p.package.ecosystem)/\($$p.package.name)@\($$p.package.version) \(.id) sev=\($$g.max_severity)" \
 	  ] | unique | .[]' osv.json); \
 	if [ -n "$$hits" ]; then \
