@@ -284,6 +284,7 @@ opengrep: bootstrap _ensure-opengrep
 	echo "opengrep: $$n rule files from $(OPENGREP_RULES), gating at $(SAST_SEVERITY)"; \
 	rc=0; \
 	opengrep scan --config "$(OPENGREP_RULES)" --severity $(SAST_SEVERITY) --error \
+	  --exclude .cicd-rules --exclude rules \
 	  --json-output opengrep.json --disable-version-check --quiet . || rc=$$?; \
 	case "$$rc" in \
 	  0) echo "OK(opengrep): no findings at/above $(SAST_SEVERITY)";; \
