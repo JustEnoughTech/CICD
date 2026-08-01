@@ -14,6 +14,10 @@ name: Security
 on:
   workflow_call:
     inputs:
+      runner:
+        type: string
+        default: ubuntu-latest
+        description: Runner label.
       gitleaks-version:
         type: string
         default: "8.18.4"
@@ -27,7 +31,7 @@ concurrency:
 
 jobs:
   secrets:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +64,7 @@ jobs:
           fi
 
   trivy:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
