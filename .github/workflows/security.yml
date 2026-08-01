@@ -169,13 +169,23 @@ jobs:
           ref: ${{ inputs.rules-ref }}
           path: .cicd-rules
           sparse-checkout: rules
+      # Move the rules OUT of the workspace before scanning. checkout can only
+      # write inside $GITHUB_WORKSPACE, but opengrep scans the workspace — so
+      # left in place it would scan its own ruleset, and several sources ship
+      # deliberately-vulnerable example files next to each rule (0xdea .c,
+      # elttam .html). Those produce guaranteed findings in every repo.
+      # Relying on --exclude for this does NOT work: the pattern semantics are
+      # subtle and `--exclude rules` was verified NOT to exclude rules/**.
+      # Physically relocating the tree removes the failure mode entirely.
+      - name: stage rules outside the scan target
+        run: mv .cicd-rules "$RUNNER_TEMP/cicd-rules"
       - name: sast (adapter — repo's `make sast` composes opengrep/njsscan/bandit)
         env:
           SAST_SEVERITY: ${{ inputs.sast-severity }}
           NJSSCAN_VERSION: ${{ inputs.njsscan-version }}
           BANDIT_VERSION: ${{ inputs.bandit-version }}
           OPENGREP_VERSION: ${{ inputs.opengrep-version }}
-          OPENGREP_RULES: ${{ github.workspace }}/.cicd-rules/rules
+          OPENGREP_RULES: ${{ runner.temp }}/cicd-rules/rules
         run: make sast
       - name: upload sast reports
         if: always() # findings are the reason the job failed — always publish them

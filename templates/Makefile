@@ -265,8 +265,10 @@ sast: bootstrap
 # forbids redistribution — and would break the air-gapped flavour outright.
 # Provenance/licence/SHA per source: rules/README.md in the CICD repo.
 #
-# CI passes OPENGREP_RULES pointing at the CICD checkout. Locally, clone CICD and
-# point at its rules/ dir, e.g. `make opengrep OPENGREP_RULES=../CICD/rules`.
+# OPENGREP_RULES must point OUTSIDE the tree being scanned — CI stages it under
+# $RUNNER_TEMP. Rules kept inside the scan target get scanned as source, and
+# several sources ship deliberately-vulnerable example files beside each rule.
+# Locally: `make opengrep OPENGREP_RULES=../CICD/rules`.
 OPENGREP_VERSION ?= 1.26.0
 OPENGREP_RULES ?= ./rules
 opengrep: bootstrap _ensure-opengrep
@@ -284,7 +286,6 @@ opengrep: bootstrap _ensure-opengrep
 	echo "opengrep: $$n rule files from $(OPENGREP_RULES), gating at $(SAST_SEVERITY)"; \
 	rc=0; \
 	opengrep scan --config "$(OPENGREP_RULES)" --severity $(SAST_SEVERITY) --error \
-	  --exclude .cicd-rules --exclude rules \
 	  --json-output opengrep.json --disable-version-check --quiet . || rc=$$?; \
 	case "$$rc" in \
 	  0) echo "OK(opengrep): no findings at/above $(SAST_SEVERITY)";; \
