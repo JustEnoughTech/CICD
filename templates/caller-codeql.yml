@@ -15,6 +15,6 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    uses: YOUR-ORG/CICD/.github/workflows/codeql.yml@v1
+    uses: YOUR-ORG/CICD/.github/workflows/codeql.yml@v1.1
     with:
       languages: "javascript-typescript"

@@ -17,7 +17,7 @@ on:
 jobs:
   security:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    uses: YOUR-ORG/CICD/.github/workflows/security.yml@v1
+    uses: YOUR-ORG/CICD/.github/workflows/security.yml@v1.1
     secrets: inherit
     # with:
     #   runner: ubuntu-latest    # set to your self-hosted runner label

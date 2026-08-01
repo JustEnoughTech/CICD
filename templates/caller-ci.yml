@@ -17,7 +17,7 @@ jobs:
   ci:
     # skip drafts — they can't merge anyway; runs when marked ready_for_review
     if: github.event.pull_request.draft == false
-    uses: YOUR-ORG/CICD/.github/workflows/ci.yml@v1
+    uses: YOUR-ORG/CICD/.github/workflows/ci.yml@v1.1
     secrets: inherit
     # with:
     #   runner: ubuntu-latest
