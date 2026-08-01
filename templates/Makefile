@@ -58,7 +58,7 @@ smoke: build
 # `fs` scan for an image scan (`trivy image $(IMAGE)`) if you build one in `build`.
 # `.trivyignore` in repo root suppresses accepted findings. Install = pinned
 # release tarball + sha256 verify (no curl|sh from an unpinned branch).
-TRIVY_VERSION ?= 0.55.0
+TRIVY_VERSION ?= 0.72.0
 trivy: bootstrap _ensure-trivy
 	trivy fs --scanners vuln \
 	  --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress .
@@ -70,6 +70,11 @@ trivy: bootstrap _ensure-trivy
 
 # Pinned, checksum-verified trivy install. Self-guards: no-op when trivy is
 # present (devs with `brew install trivy`), installs only in CI.
+#
+# NOTE: aquasecurity prunes old releases. A TRIVY_VERSION whose release has been
+# deleted upstream 404s here and takes the mandatory `security / trivy` gate down
+# in every repo at once. It fails LOUD (curl -f -> non-zero), not silently, but
+# when bumping check the tag still exists rather than assuming it is permanent.
 _ensure-trivy:
 	@command -v trivy >/dev/null 2>&1 && exit 0; \
 	  set -eu; ver="$(TRIVY_VERSION)"; \

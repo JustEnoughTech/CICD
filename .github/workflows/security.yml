@@ -35,6 +35,12 @@ on:
       gitleaks-version:
         type: string
         default: "8.18.4"
+      trivy-version:
+        type: string
+        default: "0.72.0"
+        description: >-
+          aquasecurity prunes old releases; a deleted tag 404s and takes this
+          mandatory gate down everywhere. Repin here, not in the repo Makefile.
       # --- SAST -------------------------------------------------------------
       sast-severity:
         type: string
@@ -120,6 +126,8 @@ jobs:
           key: trivy-db-${{ steps.dbkey.outputs.week }}
           restore-keys: trivy-db-
       - name: trivy scan (adapter — repo's `make trivy` owns fs-vs-image, severity)
+        env:
+          TRIVY_VERSION: ${{ inputs.trivy-version }}
         run: make trivy
 
   sast:
