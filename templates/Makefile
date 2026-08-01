@@ -5,8 +5,8 @@
 # Put toolchain/dependency install in `bootstrap`; lanes depend on it, so CI
 # never needs stack-specific setup steps.
 .PHONY: bootstrap lint format-check format test e2e build smoke trivy secrets hooks \
-        sast njsscan bandit sca sbom dast dast-target dast-up dast-down \
-        _ensure-trivy _ensure-gitleaks _ensure-osv _ensure-syft
+        sast opengrep njsscan bandit sca sbom dast dast-target dast-up dast-down \
+        _ensure-trivy _ensure-gitleaks _ensure-osv _ensure-syft _ensure-opengrep
 
 # Install deps / toolchain. Examples:
 #   npm ci   |   pnpm i --frozen-lockfile   |   go mod download   |   pip install -r requirements.txt
@@ -216,13 +216,76 @@ _ensure-syft:
 # why the language-agnostic opengrep lane is NOT wired here yet.
 #
 # Compose for your stack, e.g.:
-#     sast: njsscan bandit      # Node + Python
-#     sast: bandit              # Python only
+#     sast: opengrep njsscan bandit   # Node + Python, plus the vendored ruleset
+#     sast: opengrep bandit           # Python / Go / C++ only
 # Opting out with `@true` is allowed but must carry a written reason — an
 # unscanned repo is a coverage gap, not a configuration choice.
 SAST_SEVERITY ?= ERROR
 sast: bootstrap
 	@echo "define: sast — compose from njsscan / bandit (see comment above)"; false
+
+# opengrep (language-agnostic). Rules are VENDORED, never fetched from a registry:
+# --config points at a local directory. `p/ci` and any semgrep.dev id would pull
+# from Semgrep Inc.'s registry under the proprietary Semgrep Rules License, which
+# forbids redistribution — and would break the air-gapped flavour outright.
+# Provenance/licence/SHA per source: rules/README.md in the CICD repo.
+#
+# CI passes OPENGREP_RULES pointing at the CICD checkout. Locally, clone CICD and
+# point at its rules/ dir, e.g. `make opengrep OPENGREP_RULES=../CICD/rules`.
+OPENGREP_VERSION ?= 1.26.0
+OPENGREP_RULES ?= ./rules
+opengrep: bootstrap _ensure-opengrep
+	@set -eu; \
+	if [ ! -d "$(OPENGREP_RULES)" ]; then \
+	  echo "FAIL(opengrep): rules directory '$(OPENGREP_RULES)' not found."; \
+	  echo "  This lane MUST NOT pass without rules — a scan with no rules finds"; \
+	  echo "  nothing and would look identical to clean code."; \
+	  exit 1; \
+	fi; \
+	n=$$(find "$(OPENGREP_RULES)" -name '*.yaml' -o -name '*.yml' | wc -l | tr -d ' '); \
+	if [ "$$n" -eq 0 ]; then \
+	  echo "FAIL(opengrep): '$(OPENGREP_RULES)' contains no rule files."; exit 1; \
+	fi; \
+	echo "opengrep: $$n rule files from $(OPENGREP_RULES), gating at $(SAST_SEVERITY)"; \
+	rc=0; \
+	opengrep scan --config "$(OPENGREP_RULES)" --severity $(SAST_SEVERITY) --error \
+	  --json-output opengrep.json --disable-version-check --quiet . || rc=$$?; \
+	case "$$rc" in \
+	  0) echo "OK(opengrep): no findings at/above $(SAST_SEVERITY)";; \
+	  1) echo "FAIL(opengrep): findings at/above $(SAST_SEVERITY) — see opengrep.json"; exit 1;; \
+	  4|5) echo "FAIL(opengrep): RULE parse failure (exit $$rc). The ruleset is broken, so"; \
+	       echo "  the scan was partially blind. This is an infrastructure failure, not a"; \
+	       echo "  clean result — never treat it as a pass."; exit 1;; \
+	  *) echo "FAIL(opengrep): exit $$rc — see exit codes in opengrep/error.py."; \
+	     echo "  Not a findings result; treating as infrastructure failure."; exit 1;; \
+	esac
+
+# Upstream ships raw executables with cosign .sig/.cert but NO checksums.txt, so
+# the digests below are OURS, recorded at vendor time. Bumping OPENGREP_VERSION
+# means recomputing them; a mismatch aborts rather than running an unverified binary.
+OPENGREP_SHA256_linux_x86_64  ?= 40c21299eeddabf743b856daa843d24f9d4a027130671cd45b3b21776fd9ab26
+OPENGREP_SHA256_linux_aarch64 ?= 3042a3b1aa98fa93407b9d66a45ab1f179b5b367e76965f56afdbd2c038fb1fa
+OPENGREP_SHA256_darwin_arm64  ?= 513ff8491f7254c9a672cf8421136a537eb53b2a8af748568bd697acdc59eefe
+_ensure-opengrep:
+	@command -v opengrep >/dev/null 2>&1 && exit 0; \
+	  set -eu; ver="$(OPENGREP_VERSION)"; \
+	  os="$$(uname -s)"; arch="$$(uname -m)"; \
+	  case "$$os/$$arch" in \
+	    Linux/x86_64)  asset=opengrep_manylinux_x86;     want="$(OPENGREP_SHA256_linux_x86_64)";; \
+	    Linux/aarch64) asset=opengrep_manylinux_aarch64; want="$(OPENGREP_SHA256_linux_aarch64)";; \
+	    Darwin/arm64)  asset=opengrep_osx_arm64;         want="$(OPENGREP_SHA256_darwin_arm64)";; \
+	    *) echo "opengrep: unsupported platform $$os/$$arch"; exit 1;; \
+	  esac; \
+	  tmp="$$(mktemp -d)"; \
+	  curl -sSfL "https://github.com/opengrep/opengrep/releases/download/v$${ver}/$${asset}" -o "$$tmp/opengrep"; \
+	  if command -v sha256sum >/dev/null 2>&1; then got="$$(sha256sum "$$tmp/opengrep" | cut -d" " -f1)"; \
+	  else got="$$(shasum -a 256 "$$tmp/opengrep" | cut -d" " -f1)"; fi; \
+	  if [ "$$got" != "$$want" ]; then \
+	    echo "FAIL: opengrep checksum mismatch for $$asset"; \
+	    echo "  expected $$want"; echo "  got      $$got"; rm -rf "$$tmp"; exit 1; \
+	  fi; \
+	  install -m0755 "$$tmp/opengrep" /usr/local/bin/opengrep; \
+	  rm -rf "$$tmp"
 
 # njsscan (Node/JS/TS). Exits 1 on ERROR findings natively; WARNING-level
 # findings only fail when SAST_SEVERITY=WARNING (adds -w). Two-level tool:

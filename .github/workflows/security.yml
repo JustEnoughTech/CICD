@@ -2,7 +2,7 @@
 # (default read-only token) can call it with no permission grant.
 #   secrets — gitleaks, language-agnostic, ALWAYS runs. Gates.
 #   trivy   — OS-package + lockfile vuln scan via `make trivy`. Gates.
-#   sast    — njsscan/bandit via `make sast`. Gates at SAST_SEVERITY.
+#   sast    — opengrep (vendored rules) + njsscan/bandit. Gates at SAST_SEVERITY.
 #   sca     — osv-scanner lockfile vulns via `make sca`. Gates at sca-severity.
 #   sbom    — syft CycloneDX + SPDX via `make sbom`. ARTIFACT-ONLY, NON-GATING.
 #
@@ -52,6 +52,19 @@ on:
       bandit-version:
         type: string
         default: "1.9.4"
+      opengrep-version:
+        type: string
+        default: "1.26.0"
+      rules-repo:
+        type: string
+        default: "JustEnoughTech/CICD"
+        description: Repo holding the vendored SAST rules (this one).
+      rules-ref:
+        type: string
+        default: "v1"
+        description: >-
+          Tag/SHA of rules-repo to pull rules from. Keep this equal to the @vX
+          the caller pins the workflow itself to, so rules and workflow move together.
       # --- SCA --------------------------------------------------------------
       sca-severity:
         type: string
@@ -135,11 +148,24 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: sast (adapter — repo's `make sast` composes njsscan/bandit for its stack)
+      # Rules are VENDORED in this repo and pulled in here, never fetched from a
+      # rule registry at scan time: the semgrep.dev registry is under a proprietary
+      # licence forbidding redistribution, and a network fetch cannot work air-gapped.
+      # Provenance, licence and commit SHA per source: rules/README.md.
+      - name: fetch vendored SAST rules (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.rules-repo }}
+          ref: ${{ inputs.rules-ref }}
+          path: .cicd-rules
+          sparse-checkout: rules
+      - name: sast (adapter — repo's `make sast` composes opengrep/njsscan/bandit)
         env:
           SAST_SEVERITY: ${{ inputs.sast-severity }}
           NJSSCAN_VERSION: ${{ inputs.njsscan-version }}
           BANDIT_VERSION: ${{ inputs.bandit-version }}
+          OPENGREP_VERSION: ${{ inputs.opengrep-version }}
+          OPENGREP_RULES: ${{ github.workspace }}/.cicd-rules/rules
         run: make sast
       - name: upload sast reports
         if: always() # findings are the reason the job failed — always publish them
@@ -147,6 +173,7 @@ jobs:
         with:
           name: sast-reports
           path: |
+            opengrep.json
             njsscan.json
             bandit.json
           if-no-files-found: ignore
