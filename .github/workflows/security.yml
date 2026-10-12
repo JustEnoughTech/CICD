@@ -189,7 +189,7 @@ jobs:
         run: make sast
       - name: upload sast reports
         if: always() # findings are the reason the job failed — always publish them
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: sast-reports
           path: |
@@ -212,7 +212,7 @@ jobs:
         run: make sca
       - name: upload sca report
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: sca-report
           path: osv.json
@@ -232,7 +232,7 @@ jobs:
         run: make sbom
       - name: upload sbom
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: sbom
           path: |
